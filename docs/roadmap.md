@@ -29,7 +29,7 @@
 |---|---|---|
 | T-05 | `pkg/mounter`：Mounter 接口、容器内 glusterfs 实现、挂载参数构造（backup-volfile-servers、mountOptions 白名单） | FakeMounter 单测；参数构造无 shell 拼接 |
 | T-06 | Node 服务：Stage/Unstage/Publish/Unpublish/GetInfo/GetCapabilities，幂等 + 错误码 | 单测覆盖重复调用、路径不存在、只读、ROX/RWOP |
-| T-07 | NodeGetVolumeStats + VOLUME_CONDITION（statfs、ENOTCONN 检测） | 单测模拟 ENOTCONN 返回 abnormal |
+| T-07 | NodeGetVolumeStats（statfs）+ NodeGetVolumeHealth（ENOTCONN 检测，D-18） | 单测模拟 ENOTCONN 时 Health 报 INACCESSIBLE、Stats 报 Internal |
 | T-08 | 挂载恢复器：启动时扫描并恢复失效 staging 挂载、刷新 bind | 单测 + 真实集群：杀掉 node 插件 Pod 后业务 Pod I/O 自动恢复 |
 | T-09 | `deploy/kustomize`：CSIDriver、RBAC、node DaemonSet、ConfigMap 样例、静态 PV/PVC/Pod 样例 | 真实集群：3 节点 Pod 同时写同一 RWX 卷，数据一致 |
 
