@@ -2,21 +2,41 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/gitlayzer/csi-driver-glusterfs/pkg/driver"
 	"github.com/gitlayzer/csi-driver-glusterfs/pkg/version"
 )
+
+// validConfig is a configuration document that passes config.Parse.
+const validConfig = `[{"clusterID":"prod","servers":["gluster-1","10.0.0.13"]}]`
 
 func validOptions() options {
 	return options{
 		endpoint:   DefaultEndpoint,
 		nodeID:     "node-1",
-		mode:       modeAll,
+		mode:       string(driver.ModeAll),
 		driverName: DriverName,
 		configPath: DefaultConfigPath,
 	}
+}
+
+// writeConfig writes content to a file in a temporary directory and returns its
+// path.
+func writeConfig(t *testing.T, content string) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return path
 }
 
 func TestValidateFlags(t *testing.T) {
@@ -31,24 +51,24 @@ func TestValidateFlags(t *testing.T) {
 		},
 		{
 			name:   "controller mode",
-			mutate: func(o *options) { o.mode = modeController },
+			mutate: func(o *options) { o.mode = string(driver.ModeController) },
 		},
 		{
 			name:   "controller mode does not need nodeid",
-			mutate: func(o *options) { o.mode, o.nodeID = modeController, "" },
+			mutate: func(o *options) { o.mode, o.nodeID = string(driver.ModeController), "" },
 		},
 		{
 			name:   "node mode with nodeid",
-			mutate: func(o *options) { o.mode = modeNode },
+			mutate: func(o *options) { o.mode = string(driver.ModeNode) },
 		},
 		{
 			name:    "node mode without nodeid",
-			mutate:  func(o *options) { o.mode, o.nodeID = modeNode, "" },
+			mutate:  func(o *options) { o.mode, o.nodeID = string(driver.ModeNode), "" },
 			wantErr: "--nodeid is required",
 		},
 		{
 			name:    "node mode with blank nodeid",
-			mutate:  func(o *options) { o.mode, o.nodeID = modeNode, "   " },
+			mutate:  func(o *options) { o.mode, o.nodeID = string(driver.ModeNode), "   " },
 			wantErr: "--nodeid is required",
 		},
 		{
@@ -92,6 +112,11 @@ func TestValidateFlags(t *testing.T) {
 			wantErr: "address must not be empty",
 		},
 		{
+			name:    "tcp endpoint without port",
+			mutate:  func(o *options) { o.endpoint = "tcp://127.0.0.1" },
+			wantErr: "invalid --endpoint",
+		},
+		{
 			name:   "tcp endpoint",
 			mutate: func(o *options) { o.endpoint = "tcp://127.0.0.1:10000" },
 		},
@@ -99,6 +124,35 @@ func TestValidateFlags(t *testing.T) {
 			name:    "empty drivername",
 			mutate:  func(o *options) { o.driverName = "" },
 			wantErr: "--drivername must not be empty",
+		},
+		{
+			name:    "drivername with leading dash",
+			mutate:  func(o *options) { o.driverName = "-abc" },
+			wantErr: "invalid --drivername",
+		},
+		{
+			name:    "drivername with trailing dash",
+			mutate:  func(o *options) { o.driverName = "abc-" },
+			wantErr: "invalid --drivername",
+		},
+		{
+			name:    "drivername with underscore",
+			mutate:  func(o *options) { o.driverName = "a_b" },
+			wantErr: "invalid --drivername",
+		},
+		{
+			name:    "drivername with space",
+			mutate:  func(o *options) { o.driverName = "a b" },
+			wantErr: "invalid --drivername",
+		},
+		{
+			name:    "drivername longer than 63 characters",
+			mutate:  func(o *options) { o.driverName = strings.Repeat("a", 64) },
+			wantErr: "invalid --drivername",
+		},
+		{
+			name:   "drivername with 63 characters",
+			mutate: func(o *options) { o.driverName = strings.Repeat("a", 63) },
 		},
 		{
 			name:    "empty config path",
@@ -142,7 +196,7 @@ func TestParseFlags(t *testing.T) {
 			args: nil,
 			want: options{
 				endpoint:   DefaultEndpoint,
-				mode:       modeAll,
+				mode:       string(driver.ModeAll),
 				driverName: DriverName,
 				configPath: DefaultConfigPath,
 			},
@@ -159,7 +213,7 @@ func TestParseFlags(t *testing.T) {
 			want: options{
 				endpoint:   "tcp://127.0.0.1:10000",
 				nodeID:     "node-1",
-				mode:       modeNode,
+				mode:       string(driver.ModeNode),
 				driverName: "example.csi.io",
 				configPath: "/tmp/config.json",
 			},
@@ -169,7 +223,7 @@ func TestParseFlags(t *testing.T) {
 			args: []string{"--version"},
 			want: options{
 				endpoint:   DefaultEndpoint,
-				mode:       modeAll,
+				mode:       string(driver.ModeAll),
 				driverName: DriverName,
 				configPath: DefaultConfigPath,
 				showVer:    true,
@@ -211,7 +265,7 @@ func TestParseFlags(t *testing.T) {
 func TestRunVersion(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 
-	if err := run([]string{"--version"}, &stdout, &stderr); err != nil {
+	if err := run(context.Background(), []string{"--version"}, &stdout, &stderr); err != nil {
 		t.Fatalf("run(--version) = %v, want nil", err)
 	}
 
@@ -224,30 +278,100 @@ func TestRunVersion(t *testing.T) {
 	}
 }
 
-func TestRunNotImplemented(t *testing.T) {
+// TestRunServesUntilCancelled starts the real server on a kernel assigned TCP
+// port (port 0) and checks that cancelling the context makes run return
+// cleanly within 2s.
+func TestRunServesUntilCancelled(t *testing.T) {
 	tests := []struct {
 		name string
-		args []string
+		mode driver.Mode
+	}{
+		{name: "controller mode", mode: driver.ModeController},
+		{name: "node mode", mode: driver.ModeNode},
+		{name: "all mode", mode: driver.ModeAll},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			var stdout, stderr bytes.Buffer
+			done := make(chan error, 1)
+			go func() {
+				done <- run(ctx, []string{
+					"--mode=" + string(tc.mode),
+					"--nodeid=node-1",
+					"--endpoint=tcp://127.0.0.1:0",
+					"--config=" + writeConfig(t, validConfig),
+				}, &stdout, &stderr)
+			}()
+
+			// Give the server time to bind before cancelling, so the test also
+			// covers the normal shutdown path rather than a failed start.
+			time.Sleep(100 * time.Millisecond)
+			cancel()
+
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("run() = %v, want nil after cancellation (stderr: %q)", err, stderr.String())
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("run() did not return within 2s of cancellation")
+			}
+		})
+	}
+}
+
+// TestRunConfigErrors checks that a broken configuration fails the start
+// instead of leaving a running plugin without any cluster.
+func TestRunConfigErrors(t *testing.T) {
+	tests := []struct {
+		name    string
+		conf    string
+		missing bool
+		wantErr string
 	}{
 		{
-			name: "controller mode needs no nodeid",
-			args: []string{"--mode=controller"},
+			name:    "missing file",
+			missing: true,
+			wantErr: "load config",
 		},
 		{
-			name: "node mode",
-			args: []string{"--mode=node", "--nodeid=node-1"},
+			name:    "invalid document",
+			conf:    `{"clusters": []}`,
+			wantErr: "load config",
+		},
+		{
+			name:    "empty document",
+			conf:    "",
+			wantErr: "load config",
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			var stdout, stderr bytes.Buffer
-
-			if err := run(tc.args, &stdout, &stderr); err != nil {
-				t.Fatalf("run(%v) = %v, want nil", tc.args, err)
+			path := filepath.Join(t.TempDir(), "config.json")
+			if !tc.missing {
+				path = writeConfig(t, tc.conf)
 			}
-			if got := strings.TrimSpace(stdout.String()); got != "not implemented yet" {
-				t.Fatalf("run(%v) printed %q, want %q", tc.args, got, "not implemented yet")
+
+			var stdout, stderr bytes.Buffer
+			err := run(context.Background(), []string{
+				"--mode=controller",
+				"--endpoint=tcp://127.0.0.1:0",
+				"--config=" + path,
+			}, &stdout, &stderr)
+
+			if err == nil {
+				t.Fatalf("run() = nil, want error containing %q", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("run() = %q, want error containing %q", err, tc.wantErr)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("run() wrote to stdout: %q", stdout.String())
 			}
 		})
 	}
@@ -281,6 +405,11 @@ func TestRunInvalidFlags(t *testing.T) {
 			wantErr: "invalid --endpoint",
 		},
 		{
+			name:    "invalid drivername",
+			args:    []string{"--mode=controller", "--drivername=_abc"},
+			wantErr: "invalid --drivername",
+		},
+		{
 			name:     "unknown flag",
 			args:     []string{"--bogus"},
 			parseErr: true,
@@ -291,7 +420,7 @@ func TestRunInvalidFlags(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 
-			err := run(tc.args, &stdout, &stderr)
+			err := run(context.Background(), tc.args, &stdout, &stderr)
 			if err == nil {
 				t.Fatalf("run(%v) = nil, want error", tc.args)
 			}
