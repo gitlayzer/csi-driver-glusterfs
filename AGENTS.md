@@ -21,7 +21,10 @@ Your task spec lives in `docs/tasks/T-xx.md`. Do exactly that task; do not touch
 | Situation | Code |
 |---|---|
 | Missing/empty required field (volume_id, target_path, capabilities, name) | `InvalidArgument` |
-| Unsupported capability (Block access type, unknown access mode) | `InvalidArgument` |
+| Malformed capability (missing access type/mode, `UNKNOWN` or unrecognised access mode) | `InvalidArgument` |
+| Unsupported capability (Block access type, unsupported fs_type/access mode) in Controller RPCs | `InvalidArgument` |
+| Unsupported capability in `NodeStageVolume` / `NodePublishVolume` (spec "Exceeds capabilities", D-16) | `FailedPrecondition` |
+| `NodePublishVolume` without `staging_target_path` (spec "Staging target path not set") | `FailedPrecondition` |
 | Volume does not exist (Node*/Validate/Expand) | `NotFound` |
 | DeleteVolume on a non-existent volume | **OK** (success) |
 | CreateVolume same name, incompatible size/params | `AlreadyExists` |

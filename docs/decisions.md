@@ -19,3 +19,4 @@
 | D-13 | GlusterFS 服务端版本 | Ubuntu 24.04 自带 11.1（apt `glusterfs-server`） | 兼容性测试另覆盖 9/10/11 |
 | D-14 | Go 最低版本（`go.mod` 的 `go` 指令） | 1.26 | 跟随 Go 官方仍在维护的最老版本；CI 与镜像构建使用最新稳定版（当前 1.27） |
 | D-15 | Dependabot 依赖升级 PR | 由架构师处理：`@dependabot rebase` 等指令 → 本地跑完整门禁 → CI 全绿 → 在对话中告知 → squash 合并 | 涉及 `go.mod` 的多个 PR 逐个合并，后续 PR 由 Dependabot 自动变基 |
+| D-16 | Node 侧不支持的卷能力的错误码 | `NodeStageVolume` / `NodePublishVolume` 遇到 Block、非 glusterfs 的 fs_type、不支持的访问模式返回 `FAILED_PRECONDITION`（CSI 规范错误表 "Exceeds capabilities"）；Controller 侧仍为 `INVALID_ARGUMENT` | 缺字段、`UNKNOWN`/无法识别的访问模式属于请求畸形，仍为 `INVALID_ARGUMENT`；AGENTS.md 错误码表同步更新 |
