@@ -1,0 +1,19 @@
+# Build artifacts
+/bin/
+/dist/
+
+# Go test binaries and coverage
+*.test
+*.out
+coverage.html
+coverage.txt
+
+# Local tooling / editor state
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local environment overrides
+.env
+*.local

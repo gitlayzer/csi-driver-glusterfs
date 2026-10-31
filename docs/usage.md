@@ -6,7 +6,7 @@
 
 **GlusterFS 侧**
 - 一个健康的可信存储池（`gluster peer status` 全部 Connected）。
-- 端口：24007/tcp（glusterd）、24008/tcp、49152–49251/tcp（brick，按 brick 数量放开）对所有 K8s 节点开放。
+- 端口：24007/tcp（glusterd）、24008/tcp、49152–60999/tcp（brick 端口，由 glusterd.vol 的 base-port/max-port 决定，Gluster 11 在该区间内随机分配）对所有 K8s 节点开放。
 - subdir 模式：预建一个父卷（建议 `replica 3`），例如 `csi-parent`；如需配额：`gluster volume quota csi-parent enable`。
 - volume / 配额 / 快照模式：一个可 SSH 登录、可执行 `gluster` 的账号（建议用受限 wrapper，见 `hack/gluster-csi-wrapper.sh`）。
 
@@ -99,5 +99,5 @@ allowVolumeExpansion: true
 |---|---|
 | Pod 报 `Transport endpoint is not connected` | node 插件被重启；查看插件日志中恢复器输出，或改用 host mounter 模式 |
 | PVC Pending | `kubectl logs deploy/glusterfs-csi-controller -c csi-provisioner`；确认父卷存在且已启动 |
-| 挂载超时 | K8s 节点到 49152+ 端口是否放通；`gluster volume status <vol>` 看 brick 端口 |
+| 挂载超时 | K8s 节点到 49152–60999 端口是否放通；`gluster volume status <vol>` 看 brick 端口 |
 | 客户端日志 | 节点上 `/var/log/glusterfs/csi/<vol>.log`（hostPath 挂出） |

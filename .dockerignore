@@ -1,0 +1,26 @@
+# Build artifacts
+bin/
+dist/
+
+# Test and coverage output
+*.test
+*.out
+coverage.html
+coverage.txt
+
+# Local tooling / editor state
+.vscode/
+.idea/
+*.swp
+
+# VCS metadata
+.git/
+.gitignore
+
+# Docs and CI config are not needed to build the binary
+docs/
+.github/
+
+# Local environment
+*.local
+.env
