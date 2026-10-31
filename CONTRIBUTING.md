@@ -15,7 +15,7 @@ Requirements:
   `go.mod` keeps a lower `go` directive so downstream consumers can build with an
   older toolchain, but please develop and test with a supported one.
 - **make** — the build entry point.
-- **golangci-lint v2.13.2** — the same version CI runs (`.golangci.yml` uses the v2 format).
+- **golangci-lint v2.15.0** — the same version CI runs (`.golangci.yml` uses the v2 format).
 - Optional: Docker with buildx for `make image`, a GlusterFS cluster for manual testing.
 
 Common targets:

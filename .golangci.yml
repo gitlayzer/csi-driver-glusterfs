@@ -1,4 +1,4 @@
-# golangci-lint configuration (v2 format, verified with golangci-lint 2.13.2).
+# golangci-lint configuration (v2 format, verified with golangci-lint 2.15.0).
 #
 # Enabled linters: govet, errcheck, staticcheck, ineffassign, unused, gosec,
 # revive, misspell, plus the gofmt and goimports formatters.
