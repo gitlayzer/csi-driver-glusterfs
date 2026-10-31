@@ -1,0 +1,90 @@
+name: Bug report
+description: Report a defect in the GlusterFS CSI driver
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        **Do not report security vulnerabilities here.** Follow [SECURITY.md](https://github.com/gitlayzer/csi-driver-glusterfs/blob/main/SECURITY.md) instead.
+
+        Please remove secrets (cluster config, SSH keys, tokens) from any log you paste.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checks
+      options:
+        - label: I searched the existing issues and this is not a duplicate.
+          required: true
+        - label: This is not a security vulnerability report.
+          required: true
+        - label: I removed secrets and credentials from the logs below.
+          required: true
+  - type: input
+    id: driver-version
+    attributes:
+      label: Driver version
+      description: Output of `./bin/glusterfs-csi --version` or the image tag, e.g. `v0.1.0` or `main@sha-1a2b3c4`.
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: kubernetes-version
+    attributes:
+      label: Kubernetes version
+      description: Output of `kubectl version`.
+      placeholder: v1.31.4 (server)
+    validations:
+      required: true
+  - type: input
+    id: gluster-version
+    attributes:
+      label: GlusterFS version
+      description: Output of `gluster --version` on the storage nodes.
+      placeholder: glusterfs 11.1
+    validations:
+      required: true
+  - type: dropdown
+    id: provisioning-mode
+    attributes:
+      label: Provisioning mode
+      description: The `provisioningMode` StorageClass parameter in use.
+      options:
+        - static
+        - subdir
+        - volume
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the observed behaviour and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal, ordered steps, including the StorageClass, PVC and pod manifests (remove secrets).
+      placeholder: |
+        1. Apply StorageClass ...
+        2. Create PVC ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: controller-logs
+    attributes:
+      label: Controller logs
+      description: Logs of the controller deployment (`kubectl -n kube-system logs deploy/glusterfs-csi-controller`).
+      render: shell
+  - type: textarea
+    id: node-logs
+    attributes:
+      label: Node logs
+      description: Logs of the node plugin (`kubectl -n kube-system logs ds/glusterfs-csi-node`).
+      render: shell

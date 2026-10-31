@@ -1,0 +1,58 @@
+name: Feature request
+description: Suggest an idea or an improvement for the GlusterFS CSI driver
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion. Please keep the project constraints in mind: the driver is
+        stateless, depends only on native glusterd and the gluster CLI, and avoids new
+        dependencies (see `docs/decisions.md`).
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight checks
+      options:
+        - label: I searched the existing issues and documentation and this is not already covered.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem are you trying to solve? Describe the use case, not the implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like the driver to do? StorageClass parameters, flags, behaviour.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches, workarounds, or existing sidecars/tools that could cover the use case.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - provisioning (static / subdir / volume)
+        - node mount / recovery
+        - snapshots
+        - resize / quota
+        - configuration / deployment manifests
+        - observability / metrics
+        - documentation
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Anything else, e.g. links, related CSI spec sections, prior art.

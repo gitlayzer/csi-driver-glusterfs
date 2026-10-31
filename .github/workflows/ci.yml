@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Only superseded PR runs are cancelled; runs on main and tags always finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GO_VERSION: "1.27"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9.3.0
+        with:
+          version: v2.13.2
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Run unit tests
+        run: go test -race -coverprofile=coverage.out ./...
+
+      - name: Print coverage total
+        run: go tool cover -func=coverage.out | tail -n 1
+
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "${unformatted}" ]; then
+            echo "The following files are not gofmt-ed:" >&2
+            echo "${unformatted}" >&2
+            exit 1
+          fi
+
+      - name: Check go.mod / go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: make build
+        run: make build
+
+      - name: Report binary version
+        run: ./bin/glusterfs-csi --version
+
+  dco:
+    name: DCO
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Check Signed-off-by on every non-merge commit
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+
+          range="${BASE_SHA}..${HEAD_SHA}"
+          echo "Checking commits in ${range}"
+
+          failed=0
+          checked=0
+          for commit in $(git rev-list --no-merges "${range}"); do
+            checked=$((checked + 1))
+            if ! git log -1 --format=%B "${commit}" | grep -q '^Signed-off-by: .\+<.\+@.\+>$'; then
+              echo "::error::Missing Signed-off-by trailer in commit ${commit}"
+              git log -1 --format='  %h %s (%an)' "${commit}"
+              failed=$((failed + 1))
+            fi
+          done
+
+          if [ "${checked}" -eq 0 ]; then
+            echo "No non-merge commits in ${range}; nothing to check."
+            exit 0
+          fi
+
+          if [ "${failed}" -ne 0 ]; then
+            echo "${failed} of ${checked} commit(s) are missing a Signed-off-by trailer." >&2
+            echo "Amend with: git commit --amend -s  (see CONTRIBUTING.md)" >&2
+            exit 1
+          fi
+
+          echo "All ${checked} non-merge commit(s) are signed off."
