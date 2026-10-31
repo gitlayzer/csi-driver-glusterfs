@@ -111,7 +111,7 @@ type Executor interface {
 - 实现 `STAGE_UNSTAGE_VOLUME`：NodeStage 在 staging 路径做一次 FUSE 挂载；NodePublish 只做 bind mount（多个 Pod 共享同一 FUSE 进程）。
 - 挂载参数：`backup-volfile-servers=<其余 servers>`、`log-level=WARNING`、`log-file=/var/log/glusterfs/csi/<vol>.log`，以及 SC `mountOptions` 透传（白名单）。
 - **FUSE 进程存活问题**：容器内 FUSE 进程随 node 插件 Pod 一起退出。分两阶段解决：
-  1. M1：容器内挂载 + 恢复器。DaemonSet `updateStrategy: OnDelete`；插件启动时扫描 kubelet 目录中本驱动的 staging 挂载，对 `ENOTCONN` 的挂载点 lazy-unmount 后按本地记录的参数重挂，再刷新 bind mount；`NodeGetVolumeHealth`（CSI v1.13 alpha，能力 `GET_VOLUME_HEALTH`）对失效挂载上报 `INACCESSIBLE`（D-18：v1.13 已删除 `VOLUME_CONDITION`）。
+  1. M1：容器内挂载 + 恢复器。DaemonSet `updateStrategy: OnDelete`；NodeStage 在 `--state-dir` 写 staging 记录（D-20）；插件启动时及每 `--recovery-interval` 扫描记录，先从 mountinfo 找出失效 staging 的全部 bind target，再对 `ENOTCONN` 的 staging lazy-unmount 后按记录参数重挂，最后逐个 lazy-unmount 并重新 bind 失效的 target；业务 Pod 声明 `mountPropagation: HostToContainer` 才能在容器内看到恢复后的挂载，否则需重启容器（D-19）；`NodeGetVolumeHealth`（CSI v1.13 alpha，能力 `GET_VOLUME_HEALTH`）对失效挂载上报 `INACCESSIBLE`（D-18：v1.13 已删除 `VOLUME_CONDITION`）。
   2. M5：`hostMounter`——通过 `nsenter -t 1 -m` 在宿主机 mount namespace 调用宿主机的 `mount.glusterfs`，FUSE 进程归属宿主机，插件升级不影响已挂载卷（需要宿主机安装 glusterfs-fuse，作为可选模式）。
 - Mounter 接口隔离，单元测试使用 fake mounter（`k8s.io/mount-utils` 的 FakeMounter）。
 

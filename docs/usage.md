@@ -97,7 +97,7 @@ allowVolumeExpansion: true
 ## 4. 常见排障
 | 现象 | 排查 |
 |---|---|
-| Pod 报 `Transport endpoint is not connected` | node 插件被重启；查看插件日志中恢复器输出，或改用 host mounter 模式 |
+| Pod 报 `Transport endpoint is not connected` | node 插件被重启，FUSE 进程随之退出。恢复器会在一个扫描周期（默认 60s）内重挂宿主机侧的挂载；volumeMount 声明了 `mountPropagation: HostToContainer` 的 Pod 自动恢复，其余 Pod 需重启容器（建议配存活探针，如定期 `stat` 挂载目录）。查看插件日志中的 recovery 输出；M5 起可改用 host mounter 模式 |
 | PVC Pending | `kubectl logs deploy/glusterfs-csi-controller -c csi-provisioner`；确认父卷存在且已启动 |
 | 挂载超时 | K8s 节点到 49152–60999 端口是否放通；`gluster volume status <vol>` 看 brick 端口 |
 | 客户端日志 | 节点上 `/var/log/glusterfs/csi/<vol>.log`（hostPath 挂出） |
