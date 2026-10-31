@@ -221,6 +221,7 @@ func New(opts Options) (*Driver, error) {
 			logDir:  opts.MountLogDir,
 			locks:   newInflight(),
 			stat:    os.Stat,
+			statFS:  statFS,
 		}
 		d.nodeRegistered = true
 	}

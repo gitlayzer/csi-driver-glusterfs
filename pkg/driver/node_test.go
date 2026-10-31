@@ -59,12 +59,27 @@ type fakeMounter struct {
 	otherBindMounts    []string
 	otherBindMountsErr error
 
+	// mountState and mountStateErr are returned by VolumeMountState; mountState
+	// defaults to MountStateMounted, the state a successful stage and publish
+	// leave behind. mountStateOf overrides the state per target path, which the
+	// health tests need because they ask about two paths in one call.
+	mountState    mounter.MountState
+	mountStateOf  map[string]mounter.MountState
+	mountStateErr error
+
 	mountCalls   []mountCall
 	bindCalls    []mountCall
 	unmountCalls []string
 	cleanupCalls []string
 	checkCalls   []string
 	otherCalls   []mountCall
+	// mountStateCalls records the arguments of every VolumeMountState call.
+	mountStateCalls []mountStateCall
+}
+
+// mountStateCall records one call of VolumeMountState.
+type mountStateCall struct {
+	target, volume, subdir string
 }
 
 // The compiler rejects drift between the interface and the fake.
@@ -140,6 +155,18 @@ func (f *fakeMounter) OtherBindMounts(source, except string) ([]string, error) {
 	return f.otherBindMounts, f.otherBindMountsErr
 }
 
+// VolumeMountState records the call and returns the injected result.
+func (f *fakeMounter) VolumeMountState(target, volume, subdir string) (mounter.MountState, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.mountStateCalls = append(f.mountStateCalls, mountStateCall{target: target, volume: volume, subdir: subdir})
+	if state, ok := f.mountStateOf[target]; ok {
+		return state, f.mountStateErr
+	}
+	return f.mountState, f.mountStateErr
+}
+
 // mountCount, bindCount, unmountCount and cleanupCount report the call counts.
 func (f *fakeMounter) mountCount() int {
 	f.mu.Lock()
@@ -165,11 +192,19 @@ func (f *fakeMounter) cleanupCount() int {
 	return len(f.cleanupCalls)
 }
 
+// mountStateCount returns how often VolumeMountState was called.
+func (f *fakeMounter) mountStateCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.mountStateCalls)
+}
+
 // newTestNode returns a node service in node mode together with its fake mounter.
 //
 // The log directory is a real temporary directory so that the tests can assert
 // that it was created; the paths of individual requests are temporary directories
-// of the caller.
+// of the caller. The fake reports MountStateMounted, and statFS is replaced by
+// fixed numbers, so that a test only has to set up the field it is about.
 func newTestNode(t *testing.T) (*nodeService, *fakeMounter) {
 	t.Helper()
 
@@ -181,9 +216,21 @@ func newTestNode(t *testing.T) (*nodeService, *fakeMounter) {
 		t.Fatalf("New() = %v, want nil", err)
 	}
 
-	fake := &fakeMounter{}
+	fake := &fakeMounter{mountState: mounter.MountStateMounted}
 	d.node.mounter = fake
+	d.node.statFS = func(string) (fsStats, error) { return testFSStats, nil }
 	return d.node, fake
+}
+
+// testFSStats is the statfs result of the fake node service, with values that a
+// response assertion can compare one by one.
+var testFSStats = fsStats{
+	totalBytes:     1000,
+	availableBytes: 400,
+	usedBytes:      600,
+	totalInodes:    100,
+	freeInodes:     60,
+	usedInodes:     40,
 }
 
 // accessModeCapability builds a mount capability with the given access mode.
@@ -1747,9 +1794,12 @@ func TestNodeGetCapabilities(t *testing.T) {
 		t.Fatalf("NodeGetCapabilities() = %v, want nil", err)
 	}
 
+	// The order is part of the response: it is the order of the enum values.
 	want := []csi.NodeServiceCapability_RPC_Type{
 		csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
+		csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
 		csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
+		csi.NodeServiceCapability_RPC_GET_VOLUME_HEALTH,
 	}
 	caps := resp.GetCapabilities()
 	if len(caps) != len(want) {
@@ -1761,14 +1811,28 @@ func TestNodeGetCapabilities(t *testing.T) {
 		}
 	}
 
-	// The RPCs of the capabilities that are deliberately not advertised must be
-	// Unimplemented, so that the CO never believes they are available.
+	// VOLUME_CONDITION was removed in CSI v1.13 and must never be advertised by
+	// its old enum value; the health reporting uses GET_VOLUME_HEALTH instead
+	// (D-18). The value 4 is not in the enum of this protocol version any more.
+	if got := int32(csi.NodeServiceCapability_RPC_GET_VOLUME_HEALTH); got != 7 {
+		t.Fatalf("GET_VOLUME_HEALTH = %d, want the post fix enum value 7", got)
+	}
+	for _, c := range caps {
+		if int32(c.GetRpc().GetType()) == 4 {
+			t.Fatal("capability 4 (the removed VOLUME_CONDITION) must not be advertised")
+		}
+	}
+
+	// NodeGetVolumeStats is advertised, so it must be served, not Unimplemented.
 	_, err = client.NodeGetVolumeStats(context.Background(), &csi.NodeGetVolumeStatsRequest{
 		VolumeId:   testVolumeID,
-		VolumePath: "/var/lib/kubelet/pods/uid/volumes/target",
+		VolumePath: "some/path",
 	})
-	wantCode(t, err, codes.Unimplemented)
+	if got := status.Code(err); got == codes.Unimplemented {
+		t.Fatalf("NodeGetVolumeStats() = %v, want it to be implemented after advertising the capability", err)
+	}
 
+	// NodeExpandVolume is not advertised, so it must answer Unimplemented.
 	_, err = client.NodeExpandVolume(context.Background(), &csi.NodeExpandVolumeRequest{
 		VolumeId:   testVolumeID,
 		VolumePath: "/var/lib/kubelet/pods/uid/volumes/target",

@@ -1076,3 +1076,337 @@ func slicesContains(s []string, v string) bool {
 	}
 	return false
 }
+
+// TestMountStateString checks the four documented names and the fallback for a
+// value this package does not define.
+func TestMountStateString(t *testing.T) {
+	tests := []struct {
+		state MountState
+		want  string
+	}{
+		{state: MountStateNotMounted, want: "NotMounted"},
+		{state: MountStateMounted, want: "Mounted"},
+		{state: MountStateMismatch, want: "Mismatch"},
+		{state: MountStateCorrupted, want: "Corrupted"},
+		{state: MountState(99), want: "MountState(99)"},
+		{state: MountState(-1), want: "MountState(-1)"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.want, func(t *testing.T) {
+			if got := tc.state.String(); got != tc.want {
+				t.Fatalf("MountState(%d).String() = %q, want %q", int(tc.state), got, tc.want)
+			}
+		})
+	}
+}
+
+func TestVolumeMountState(t *testing.T) {
+	ctx := context.Background()
+
+	// scenario builds a mounter plus the target path to ask about. The volume
+	// and subdir of the question are fixed per case below.
+	tests := []struct {
+		name   string
+		volume string
+		subdir string
+		// setup mounts things and returns the target path to query.
+		setup func(t *testing.T, m Mounter, fake *mount.FakeMounter) string
+		// wrap replaces the mount table of fake, nil for none.
+		wrap func(fake *mount.FakeMounter) mount.Interface
+		want MountState
+		// wantInvalidSpec expects an error wrapping ErrInvalidSpec.
+		wantInvalidSpec bool
+		// wantErr is a substring the returned error must contain.
+		wantErr string
+	}{
+		{
+			name:   "missing path",
+			volume: "vol",
+			setup: func(t *testing.T, _ Mounter, _ *mount.FakeMounter) string {
+				t.Helper()
+				return filepath.Join(t.TempDir(), "does-not-exist")
+			},
+			want: MountStateNotMounted,
+		},
+		{
+			name:   "existing directory that is not mounted",
+			volume: "vol",
+			setup: func(t *testing.T, _ Mounter, _ *mount.FakeMounter) string {
+				t.Helper()
+				return t.TempDir()
+			},
+			want: MountStateNotMounted,
+		},
+		{
+			name:   "mounted volume",
+			volume: "vol",
+			setup: func(t *testing.T, m Mounter, _ *mount.FakeMounter) string {
+				t.Helper()
+				target := t.TempDir()
+				if err := m.MountGlusterfs(ctx, Spec{Servers: []string{"g1"}, Volume: "vol"}, target); err != nil {
+					t.Fatalf("MountGlusterfs(%q) = %v, want nil", target, err)
+				}
+				return target
+			},
+			want: MountStateMounted,
+		},
+		{
+			name:   "mounted volume, subdir asked for",
+			volume: "vol",
+			subdir: "a",
+			setup: func(t *testing.T, m Mounter, _ *mount.FakeMounter) string {
+				t.Helper()
+				target := t.TempDir()
+				if err := m.MountGlusterfs(ctx, Spec{Servers: []string{"g1"}, Volume: "vol"}, target); err != nil {
+					t.Fatalf("MountGlusterfs(%q) = %v, want nil", target, err)
+				}
+				return target
+			},
+			want: MountStateMismatch,
+		},
+		{
+			name:   "mounted volume, another volume asked for",
+			volume: "other",
+			setup: func(t *testing.T, m Mounter, _ *mount.FakeMounter) string {
+				t.Helper()
+				target := t.TempDir()
+				if err := m.MountGlusterfs(ctx, Spec{Servers: []string{"g1"}, Volume: "vol"}, target); err != nil {
+					t.Fatalf("MountGlusterfs(%q) = %v, want nil", target, err)
+				}
+				return target
+			},
+			want: MountStateMismatch,
+		},
+		{
+			name:   "mounted subdir",
+			volume: "vol",
+			subdir: "a",
+			setup: func(t *testing.T, m Mounter, _ *mount.FakeMounter) string {
+				t.Helper()
+				target := t.TempDir()
+				spec := Spec{Servers: []string{"g1"}, Volume: "vol", Subdir: "a"}
+				if err := m.MountGlusterfs(ctx, spec, target); err != nil {
+					t.Fatalf("MountGlusterfs(%q) = %v, want nil", target, err)
+				}
+				return target
+			},
+			want: MountStateMounted,
+		},
+		{
+			name:   "mounted subdir, the whole volume asked for",
+			volume: "vol",
+			setup: func(t *testing.T, m Mounter, _ *mount.FakeMounter) string {
+				t.Helper()
+				target := t.TempDir()
+				spec := Spec{Servers: []string{"g1"}, Volume: "vol", Subdir: "a"}
+				if err := m.MountGlusterfs(ctx, spec, target); err != nil {
+					t.Fatalf("MountGlusterfs(%q) = %v, want nil", target, err)
+				}
+				return target
+			},
+			want: MountStateMismatch,
+		},
+		{
+			name:   "another server of the same volume",
+			volume: "vol",
+			setup: func(t *testing.T, _ Mounter, fake *mount.FakeMounter) string {
+				t.Helper()
+				_, resolved := newTestTarget(t)
+				fake.MountPoints = []mount.MountPoint{
+					{Device: "g2:/vol", Path: resolved, Type: "fuse.glusterfs"},
+				}
+				return resolved
+			},
+			want: MountStateMounted,
+		},
+		{
+			name:   "mount of another file system type",
+			volume: "vol",
+			setup: func(t *testing.T, _ Mounter, fake *mount.FakeMounter) string {
+				t.Helper()
+				_, resolved := newTestTarget(t)
+				fake.MountPoints = []mount.MountPoint{
+					{Device: "nfs:/vol", Path: resolved, Type: "nfs"},
+				}
+				return resolved
+			},
+			want: MountStateMismatch,
+		},
+		{
+			name:   "bind mount of the volume",
+			volume: "vol",
+			setup: func(t *testing.T, m Mounter, fake *mount.FakeMounter) string {
+				t.Helper()
+				// The resolved staging path: FakeMounter only replaces the bind
+				// source by the original device when it matches the recorded mount
+				// point exactly.
+				_, staging := newTestTarget(t)
+				if err := m.MountGlusterfs(ctx, Spec{Servers: []string{"g1"}, Volume: "vol"}, staging); err != nil {
+					t.Fatalf("MountGlusterfs(%q) = %v, want nil", staging, err)
+				}
+				target, resolved := newTestTarget(t)
+				if err := m.BindMount(ctx, staging, target, false); err != nil {
+					t.Fatalf("BindMount(%q, %q) = %v, want nil", staging, target, err)
+				}
+				// FakeMounter records a bind mount with an empty fs type. Linux
+				// reports the type of the original mount in /proc/mounts, so the
+				// entry is fixed up here to model a real node. Production code
+				// must not be relaxed for this.
+				setMountPointType(t, fake, resolved, "fuse.glusterfs")
+				return target
+			},
+			want: MountStateMounted,
+		},
+		{
+			name:   "corrupted mount",
+			volume: "vol",
+			setup: func(t *testing.T, _ Mounter, fake *mount.FakeMounter) string {
+				t.Helper()
+				target := t.TempDir()
+				fake.MountCheckErrors = map[string]error{target: syscall.ENOTCONN}
+				return target
+			},
+			want: MountStateCorrupted,
+		},
+		{
+			name:   "mount point missing from the mount table",
+			volume: "vol",
+			setup: func(t *testing.T, _ Mounter, _ *mount.FakeMounter) string {
+				t.Helper()
+				return t.TempDir()
+			},
+			wrap: func(fake *mount.FakeMounter) mount.Interface { return &lyingMounter{FakeMounter: fake} },
+			want: MountStateMismatch,
+		},
+		{
+			name:   "mount table does not list the target",
+			volume: "vol",
+			setup: func(t *testing.T, _ Mounter, fake *mount.FakeMounter) string {
+				t.Helper()
+				// Mounted through the plain mounter: the wrapped one lies about
+				// the mount point before anything is mounted.
+				target := t.TempDir()
+				plain := New(fake, testLogDir)
+				if err := plain.MountGlusterfs(ctx, Spec{Servers: []string{"g1"}, Volume: "vol"}, target); err != nil {
+					t.Fatalf("MountGlusterfs(%q) = %v, want nil", target, err)
+				}
+				return target
+			},
+			wrap: func(fake *mount.FakeMounter) mount.Interface {
+				return &lyingListMounter{FakeMounter: fake}
+			},
+			want: MountStateMismatch,
+		},
+		{
+			name:   "mount table cannot be read",
+			volume: "vol",
+			setup: func(t *testing.T, m Mounter, _ *mount.FakeMounter) string {
+				t.Helper()
+				target := t.TempDir()
+				if err := m.MountGlusterfs(ctx, Spec{Servers: []string{"g1"}, Volume: "vol"}, target); err != nil {
+					t.Fatalf("MountGlusterfs(%q) = %v, want nil", target, err)
+				}
+				return target
+			},
+			wrap: func(fake *mount.FakeMounter) mount.Interface {
+				return &failingListMounter{FakeMounter: fake, err: errors.New("injected list failure")}
+			},
+			wantErr: "injected list failure",
+		},
+		{
+			name:   "mount point check fails",
+			volume: "vol",
+			setup: func(t *testing.T, _ Mounter, fake *mount.FakeMounter) string {
+				t.Helper()
+				target := t.TempDir()
+				fake.MountCheckErrors = map[string]error{target: errors.New("injected check failure")}
+				return target
+			},
+			wantErr: "injected check failure",
+		},
+		{
+			name:    "relative target",
+			volume:  "vol",
+			setup:   func(t *testing.T, _ Mounter, _ *mount.FakeMounter) string { t.Helper(); return "relative" },
+			wantErr: "invalid mount spec",
+		},
+		{
+			name:    "volume with a slash",
+			volume:  "vol/x",
+			setup:   func(t *testing.T, _ Mounter, _ *mount.FakeMounter) string { t.Helper(); return t.TempDir() },
+			wantErr: "invalid mount spec",
+		},
+		{
+			name:    "parent element subdir",
+			volume:  "vol",
+			subdir:  "..",
+			setup:   func(t *testing.T, _ Mounter, _ *mount.FakeMounter) string { t.Helper(); return t.TempDir() },
+			wantErr: "invalid mount spec",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := mount.NewFakeMounter(nil)
+			var inner mount.Interface = fake
+			if tc.wrap != nil {
+				inner = tc.wrap(fake)
+			}
+			m := New(inner, testLogDir)
+			target := tc.setup(t, m, fake)
+
+			state, err := m.VolumeMountState(target, tc.volume, tc.subdir)
+			if tc.wantInvalidSpec {
+				if !errors.Is(err, ErrInvalidSpec) {
+					t.Fatalf("VolumeMountState(%q, %q, %q) = %v, want ErrInvalidSpec", target, tc.volume, tc.subdir, err)
+				}
+				return
+			}
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("VolumeMountState(%q, %q, %q) = %v, want an error containing %q",
+						target, tc.volume, tc.subdir, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("VolumeMountState(%q, %q, %q) = %v, want nil", target, tc.volume, tc.subdir, err)
+			}
+			if state != tc.want {
+				t.Fatalf("VolumeMountState(%q, %q, %q) = %v, want %v", target, tc.volume, tc.subdir, state, tc.want)
+			}
+		})
+	}
+
+	t.Run("does not mount or unmount anything", func(t *testing.T) {
+		fake := mount.NewFakeMounter(nil)
+		m := New(fake, testLogDir)
+		target := t.TempDir()
+		if err := m.MountGlusterfs(ctx, Spec{Servers: []string{"g1"}, Volume: "vol"}, target); err != nil {
+			t.Fatalf("MountGlusterfs(%q) = %v, want nil", target, err)
+		}
+		fake.ResetLog()
+
+		if _, err := m.VolumeMountState(target, "vol", ""); err != nil {
+			t.Fatalf("VolumeMountState(%q) = %v, want nil", target, err)
+		}
+		if log := fake.GetLog(); len(log) != 0 {
+			t.Fatalf("mount log = %+v, want no action", log)
+		}
+	})
+}
+
+// setMountPointType overwrites the file system type of the mount table entry of
+// path. It is needed because mount.FakeMounter records a bind mount with an empty
+// type, while Linux reports the type of the original mount ("fuse.glusterfs").
+func setMountPointType(t *testing.T, fake *mount.FakeMounter, path, fsType string) {
+	t.Helper()
+	for i := range fake.MountPoints {
+		if fake.MountPoints[i].Path == path {
+			fake.MountPoints[i].Type = fsType
+			return
+		}
+	}
+	t.Fatalf("no mount point entry for %q in %+v", path, fake.MountPoints)
+}

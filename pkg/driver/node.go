@@ -49,9 +49,10 @@ const (
 // testEmbeddedByValue, so embedding the two in one type would make every
 // selector on them ambiguous.
 type nodeService struct {
-	// UnimplementedNodeServer keeps NodeGetVolumeStats (T-07), NodeExpandVolume
-	// and every RPC added by a later version of the protocol Unimplemented
-	// instead of answering them with a nil error.
+	// UnimplementedNodeServer keeps NodeExpandVolume and every RPC added by a
+	// later version of the protocol Unimplemented instead of answering them with
+	// a nil error. NodeGetVolumeStats and NodeGetVolumeHealth are implemented in
+	// volumestats.go and volumehealth.go.
 	csi.UnimplementedNodeServer
 
 	driver *Driver
@@ -65,6 +66,10 @@ type nodeService struct {
 	// stat is os.Stat; a field so that tests can simulate a corrupted mount
 	// point, which no real directory of a unit test can be.
 	stat func(name string) (os.FileInfo, error)
+	// statFS reads the file system statistics of a path; a field so that tests
+	// can simulate statfs results and failures, which a unit test cannot rely on
+	// the host file system for. NodeGetVolumeStats uses it.
+	statFS func(path string) (fsStats, error)
 }
 
 // validatePath validates a path that is used as a mount point. An empty value is
@@ -492,13 +497,20 @@ func (s *nodeService) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 // nodeRPCapabilities is the fixed capability list of NodeGetCapabilities. The
 // order is part of the response, so it lives in one place.
 //
-// GET_VOLUME_STATS (T-07) and EXPAND_VOLUME are deliberately absent, as is
-// VOLUME_CONDITION: advertising them would make the CO call RPCs that answer
-// Unimplemented. SINGLE_NODE_MULTI_WRITER is advertised because several Pods on
-// one node may use the same GlusterFS volume.
+// GET_VOLUME_STATS is advertised because NodeGetVolumeStats is implemented, and
+// GET_VOLUME_HEALTH because of D-18: CSI v1.13 deleted VOLUME_CONDITION (both the
+// capability value 4 and the volume_condition field of the statistics response
+// are reserved) and replaced it with this alpha RPC, which is the only way to
+// report a dead FUSE mount to the CO. SINGLE_NODE_MULTI_WRITER is advertised
+// because several Pods on one node may use the same GlusterFS volume.
+//
+// EXPAND_VOLUME stays absent: resizing a GlusterFS volume happens on the
+// controller side (quota or LV), the node never has to do anything for it.
 var nodeRPCapabilities = []csi.NodeServiceCapability_RPC_Type{
 	csi.NodeServiceCapability_RPC_STAGE_UNSTAGE_VOLUME,
+	csi.NodeServiceCapability_RPC_GET_VOLUME_STATS,
 	csi.NodeServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
+	csi.NodeServiceCapability_RPC_GET_VOLUME_HEALTH,
 }
 
 // NodeGetCapabilities reports the node capabilities.

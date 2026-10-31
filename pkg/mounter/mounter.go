@@ -13,6 +13,8 @@ import (
 
 	"k8s.io/klog/v2"
 	mount "k8s.io/mount-utils"
+
+	"github.com/gitlayzer/csi-driver-glusterfs/pkg/volumeid"
 )
 
 var (
@@ -46,6 +48,44 @@ var corruptedErrs = []error{
 // with "glusterfs", the kernel reports "fuse.glusterfs" in /proc/mounts.
 var glusterfsTypes = []string{FSType, "fuse.glusterfs"}
 
+// MountState describes what is mounted at a path, as far as one volume is
+// concerned. It is the read only counterpart of the mount operations: it never
+// changes anything, which is what the monitoring RPCs of the Node service need.
+type MountState int
+
+const (
+	// MountStateNotMounted is the zero state: the path does not exist or is not a
+	// mount point.
+	MountStateNotMounted MountState = iota
+	// MountStateMounted means the path is a glusterfs mount of the requested
+	// volume (the FUSE mount itself or a bind mount of it).
+	MountStateMounted
+	// MountStateMismatch means the path is a mount point of something else
+	// (another volume or subdirectory, another file system type, or a mount point
+	// that the mount table does not list).
+	MountStateMismatch
+	// MountStateCorrupted means the path is a mount point whose file system
+	// stopped responding (ENOTCONN and the other errors of isCorrupted).
+	MountStateCorrupted
+)
+
+// String returns "NotMounted", "Mounted", "Mismatch", "Corrupted", or
+// "MountState(<n>)" for a value this package does not define.
+func (s MountState) String() string {
+	switch s {
+	case MountStateNotMounted:
+		return "NotMounted"
+	case MountStateMounted:
+		return "Mounted"
+	case MountStateMismatch:
+		return "Mismatch"
+	case MountStateCorrupted:
+		return "Corrupted"
+	default:
+		return fmt.Sprintf("MountState(%d)", int(s))
+	}
+}
+
 // Mounter mounts and unmounts GlusterFS volumes. Every method is idempotent:
 // repeating a successful call succeeds with the same result, which is what the
 // CSI idempotency requirements demand.
@@ -64,9 +104,17 @@ type Mounter interface {
 	// by NodeUnpublishVolume.
 	Cleanup(ctx context.Context, target string) error
 	// IsMountPoint reports whether target is a mount point. A corrupted mount
-	// point returns (false, error wrapping ErrCorruptedMount), which
-	// NodeGetVolumeStats (T-07) reports as VOLUME_CONDITION.
+	// point returns (false, error wrapping ErrCorruptedMount).
 	IsMountPoint(target string) (bool, error)
+	// VolumeMountState reports what is mounted at target with respect to the
+	// glusterfs volume volume[/subdir]. err is non-nil only when the state
+	// cannot be determined (invalid arguments, unreadable mount table, a stat
+	// failure other than "does not exist" and "corrupted").
+	//
+	// It is the read only primitive of NodeGetVolumeStats and
+	// NodeGetVolumeHealth, which must never take an in-flight lock or change
+	// anything on the node.
+	VolumeMountState(target, volume, subdir string) (MountState, error)
 	// OtherBindMounts returns the mount points that show the file system
 	// mounted at source, except source itself and except, i.e. the bind mounts
 	// of a staging path other than one target path. NodePublishVolume uses it
@@ -341,6 +389,58 @@ func (m *mounter) OtherBindMounts(source, except string) ([]string, error) {
 		}
 	}
 	return others, nil
+}
+
+// VolumeMountState implements [Mounter.VolumeMountState].
+//
+// Only the volume (and subdirectory) part of the mount source is compared, not
+// the server in front of it: a glusterfs mount may have been established through
+// any of the configured servers after a failover, and the volume is the same.
+func (m *mounter) VolumeMountState(target, volume, subdir string) (MountState, error) {
+	if err := validatePath("target", target); err != nil {
+		return 0, err
+	}
+	if err := volumeid.ValidateName("volume", volume); err != nil {
+		return 0, specErrf("volume", "%v", err)
+	}
+	if subdir != "" {
+		if err := volumeid.ValidateName("subdir", subdir); err != nil {
+			return 0, specErrf("subdir", "%v", err)
+		}
+	}
+
+	mounted, err := m.IsMountPoint(target)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return MountStateNotMounted, nil
+	case errors.Is(err, ErrCorruptedMount):
+		return MountStateCorrupted, nil
+	case err != nil:
+		// Already wrapped with the target by IsMountPoint.
+		return 0, err
+	case !mounted:
+		return MountStateNotMounted, nil
+	}
+
+	entry, found, err := m.findMountEntry(target)
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		// IsMountPoint said yes but the mount table does not list the target:
+		// the mount is there but not describable, so it cannot be ours.
+		return MountStateMismatch, nil
+	}
+
+	// The same source shape as BuildMountArgs builds: "/volume[/subdir]".
+	want := "/" + volume
+	if subdir != "" {
+		want += "/" + subdir
+	}
+	if slices.Contains(glusterfsTypes, entry.Type) && volumePath(entry.Device) == want {
+		return MountStateMounted, nil
+	}
+	return MountStateMismatch, nil
 }
 
 // findMountEntry returns the mount table entry of target, preferring the last
