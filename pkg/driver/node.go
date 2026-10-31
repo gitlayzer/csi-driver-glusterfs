@@ -61,8 +61,12 @@ type nodeService struct {
 	mounter mounter.Mounter
 	// logDir is the directory of the per-volume mount logs, empty for none.
 	logDir string
+	// records is the store of the staging records the recovery works from, nil
+	// when --state-dir is empty, which disables writing records and the recovery
+	// (D-20).
+	records *recordStore
 	// locks rejects concurrent operations on the same volume or target.
-	locks *inflight
+	locks lockTable
 	// stat is os.Stat; a field so that tests can simulate a corrupted mount
 	// point, which no real directory of a unit test can be.
 	stat func(name string) (os.FileInfo, error)
@@ -204,8 +208,37 @@ func (s *nodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		ReadOnly: capability.readOnly,
 		Options:  capability.mountFlags,
 	}
-	if err := s.mountGlusterfs(ctx, spec, staging, req.GetVolumeId()); err != nil {
+	rec := stageRecord{
+		Version:           stageRecordVersion,
+		VolumeID:          req.GetVolumeId(),
+		StagingTargetPath: staging,
+		ReadOnly:          capability.readOnly,
+		MountFlags:        capability.mountFlags,
+		Targets:           s.previousTargets(req.GetVolumeId()),
+	}
+	if err := s.mountGlusterfs(ctx, spec, &rec); err != nil {
 		return nil, err
+	}
+
+	// Bind targets of an interrupted recovery, or of the corrupted mount that
+	// mountGlusterfs just replaced, still show the dead FUSE mount. They are
+	// refreshed now rather than by the next recovery pass, which may be a
+	// whole interval away or, with --recovery-interval=0, never come.
+	if len(rec.Targets) > 0 {
+		rec.Targets, _ = s.refreshTargets(ctx, rec, id)
+	}
+
+	// The record is what the recovery needs to find the volumes that are staged
+	// on this node (D-20). It is written after the successful mount, so a stage
+	// that failed leaves no record behind; Targets keeps only the bind targets
+	// that could not be refreshed. A failure to write the record fails the
+	// call, but the mount is kept: repeating the request is idempotent and only
+	// rewrites the record.
+	if s.records != nil {
+		if saveErr := s.records.save(rec); saveErr != nil {
+			return nil, status.Errorf(codes.Internal, "record staged volume %s: %v",
+				echoVolumeID(req.GetVolumeId()), saveErr)
+		}
 	}
 
 	// volume_context and publish_context are ignored on purpose: the volume_id is
@@ -218,25 +251,65 @@ func (s *nodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
-// mountGlusterfs performs the FUSE mount and recovers once from a corrupted
-// staging mount point.
+// mountGlusterfs performs the FUSE mount of rec and recovers once from a
+// corrupted staging mount point.
 //
 // A target that is mounted but returns ENOTCONN means the FUSE process of a
 // previous instance of this plugin died. Unmounting and mounting again is the
 // only way out, and it is retried exactly once: a second failure is a real
 // backend problem, and retrying it in a loop would only block the CO.
-func (s *nodeService) mountGlusterfs(ctx context.Context, spec mounter.Spec, staging, volumeID string) error {
+//
+// The recovery follows the order of [nodeService.recoverVolume]: the bind
+// targets of the dead mount are read from mountinfo and added to rec.Targets
+// before the unmount removes the mountinfo entry that identifies them, and the
+// record is saved before the unmount, so that a crash in between does not lose
+// them. kubelet calls NodeStageVolume again for a staged volume after its own
+// restart, so this path competes with the recovery for the same dead mounts.
+func (s *nodeService) mountGlusterfs(ctx context.Context, spec mounter.Spec, rec *stageRecord) error {
+	staging := rec.StagingTargetPath
 	err := s.mounter.MountGlusterfs(ctx, spec, staging)
 	if !errors.Is(err, mounter.ErrCorruptedMount) {
 		return mountErrorToStatus("stage volume", err)
 	}
 
 	klog.InfoS("staging mount is corrupted, unmounting and mounting again",
-		"volumeID", volumeID, "stagingTargetPath", staging)
+		"volumeID", rec.VolumeID, "stagingTargetPath", staging)
+	found, ferr := s.mounter.BindTargets(staging)
+	if ferr != nil {
+		// Not fatal: the volume can still be staged, only the Pods that use the
+		// dead mount keep seeing ENOTCONN until they are restarted.
+		klog.ErrorS(ferr, "cannot find the bind mounts of a corrupted staging mount, they are not refreshed",
+			"volumeID", rec.VolumeID, "stagingTargetPath", staging)
+	}
+	rec.Targets = mergeTargets(rec.Targets, found)
+	if s.records != nil && len(rec.Targets) > 0 {
+		if serr := s.records.save(*rec); serr != nil {
+			return status.Errorf(codes.Internal, "record the bind targets of volume %s: %v",
+				echoVolumeID(rec.VolumeID), serr)
+		}
+	}
+
 	if uerr := s.mounter.Unmount(ctx, staging); uerr != nil {
 		return mountErrorToStatus("stage volume", uerr)
 	}
 	return mountErrorToStatus("stage volume", s.mounter.MountGlusterfs(ctx, spec, staging))
+}
+
+// previousTargets returns the bind targets an interrupted recovery left in the
+// record of a volume. A missing or unreadable record has none: NodeStageVolume
+// replaces it anyway.
+func (s *nodeService) previousTargets(volumeID string) []recordTarget {
+	if s.records == nil {
+		return nil
+	}
+	rec, err := s.records.load(volumeID)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			klog.V(2).InfoS("ignoring an unreadable staging record", "volumeID", volumeID, "err", err)
+		}
+		return nil
+	}
+	return rec.Targets
 }
 
 // cluster returns the configured GlusterFS cluster of a decoded volume id.
@@ -318,6 +391,15 @@ func (s *nodeService) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstag
 	// Unmount, not Cleanup: the staging directory belongs to kubelet.
 	if err := s.mounter.Unmount(ctx, req.GetStagingTargetPath()); err != nil {
 		return nil, mountErrorToStatus("unstage volume", err)
+	}
+
+	// The record is removed only after a successful unmount: as long as the mount
+	// is there, the recovery must still know about it.
+	if s.records != nil {
+		if rmErr := s.records.remove(req.GetVolumeId()); rmErr != nil {
+			return nil, status.Errorf(codes.Internal, "remove the record of staged volume %s: %v",
+				echoVolumeID(req.GetVolumeId()), rmErr)
+		}
 	}
 
 	klog.V(2).InfoS("unstaged volume", "volumeID", req.GetVolumeId(),

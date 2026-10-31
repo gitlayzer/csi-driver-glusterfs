@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -45,11 +46,18 @@ type mountCall struct {
 type fakeMounter struct {
 	mu sync.Mutex
 
-	// mountErrs, bindErrs, unmountErrs and cleanupErrs are the queued errors.
-	mountErrs   []error
-	bindErrs    []error
-	unmountErrs []error
-	cleanupErrs []error
+	// mountErrs, bindErrs, unmountErrs, cleanupErrs, bindTargetsErrs and
+	// detachErrs are the queued errors.
+	mountErrs       []error
+	bindErrs        []error
+	unmountErrs     []error
+	cleanupErrs     []error
+	bindTargetsErrs []error
+	detachErrs      []error
+
+	// bindTargets and bindTargetsErr are returned by BindTargets.
+	bindTargets    []mounter.BindTarget
+	bindTargetsErr error
 
 	// isMountPointErr is returned by IsMountPoint; isMountPoint is its result.
 	isMountPointErr error
@@ -66,6 +74,9 @@ type fakeMounter struct {
 	mountState    mounter.MountState
 	mountStateOf  map[string]mounter.MountState
 	mountStateErr error
+	// mountStateErrOf overrides the error per target path, for the cases that
+	// need one path to be readable and another one not.
+	mountStateErrOf map[string]error
 
 	mountCalls   []mountCall
 	bindCalls    []mountCall
@@ -75,6 +86,28 @@ type fakeMounter struct {
 	otherCalls   []mountCall
 	// mountStateCalls records the arguments of every VolumeMountState call.
 	mountStateCalls []mountStateCall
+	// bindTargetCalls records the source of every BindTargets call and
+	// detachCalls the target of every Detach call.
+	bindTargetCalls []string
+	detachCalls     []string
+	// calls is the ordered log of the calls that change or inspect the mount
+	// state, spelled "bindTargets:/s", "detach:/s", "unmount:/s", "mount:/s" and
+	// "bind:/source->/target:ro". The recovery tests assert the exact order with
+	// it, which the per-method call lists cannot express.
+	calls []string
+	// onDetach is called synchronously at the end of a successful Detach, before
+	// the lock is released. Tests use it to observe the state of the world at the
+	// moment of the detach, which is the only way to assert that something was
+	// saved before it.
+	onDetach func(target string)
+	// onUnmount is the same hook for Unmount, which the corrupted staging path of
+	// NodeStageVolume uses instead of Detach.
+	onUnmount func(target string)
+	// trackState makes VolumeMountState answer from the state the successful
+	// mount calls of the fake left behind, so that a test can run two recovery
+	// passes over the same fake. It is off by default: the tests that inject one
+	// fixed state rely on VolumeMountState answering the same thing every time.
+	trackState bool
 }
 
 // mountStateCall records one call of VolumeMountState.
@@ -84,6 +117,38 @@ type mountStateCall struct {
 
 // The compiler rejects drift between the interface and the fake.
 var _ mounter.Mounter = (*fakeMounter)(nil)
+
+// record appends an entry to the ordered call log. The caller holds the lock.
+func (f *fakeMounter) record(entry string) {
+	f.calls = append(f.calls, entry)
+}
+
+// roSuffix renders a read-only flag as the "ro"/"rw" suffix of a log entry.
+func roSuffix(readOnly bool) string {
+	if readOnly {
+		return "ro"
+	}
+	return "rw"
+}
+
+// setState records the mount state of a path when the fake tracks it. The caller
+// holds the lock.
+func (f *fakeMounter) setState(target string, state mounter.MountState) {
+	if !f.trackState {
+		return
+	}
+	if f.mountStateOf == nil {
+		f.mountStateOf = make(map[string]mounter.MountState)
+	}
+	f.mountStateOf[target] = state
+}
+
+// callLog returns a copy of the ordered call log.
+func (f *fakeMounter) callLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.calls)
+}
 
 // next pops the first queued error of queue and returns the rest.
 func next(queue []error) (rest []error, err error) {
@@ -101,6 +166,10 @@ func (f *fakeMounter) MountGlusterfs(_ context.Context, spec mounter.Spec, targe
 	var err error
 	f.mountErrs, err = next(f.mountErrs)
 	f.mountCalls = append(f.mountCalls, mountCall{spec: spec, target: target})
+	f.record("mount:" + target)
+	if err == nil {
+		f.setState(target, mounter.MountStateMounted)
+	}
 	return err
 }
 
@@ -112,6 +181,45 @@ func (f *fakeMounter) BindMount(_ context.Context, source, target string, readOn
 	var err error
 	f.bindErrs, err = next(f.bindErrs)
 	f.bindCalls = append(f.bindCalls, mountCall{source: source, target: target, readOnly: readOnly})
+	f.record("bind:" + source + "->" + target + ":" + roSuffix(readOnly))
+	if err == nil {
+		f.setState(target, mounter.MountStateMounted)
+	}
+	return err
+}
+
+// BindTargets records the call and returns the injected result.
+func (f *fakeMounter) BindTargets(source string) ([]mounter.BindTarget, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var err error
+	f.bindTargetsErrs, err = next(f.bindTargetsErrs)
+	f.bindTargetCalls = append(f.bindTargetCalls, source)
+	f.record("bindTargets:" + source)
+	if err != nil {
+		return nil, err
+	}
+	return f.bindTargets, f.bindTargetsErr
+}
+
+// Detach records the call and returns the next queued error. A successful detach
+// of a path the fake tracks leaves it not mounted, which is what a lazy unmount
+// of a dead mount does.
+func (f *fakeMounter) Detach(target string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var err error
+	f.detachErrs, err = next(f.detachErrs)
+	f.detachCalls = append(f.detachCalls, target)
+	f.record("detach:" + target)
+	if err == nil {
+		f.setState(target, mounter.MountStateNotMounted)
+	}
+	if hook := f.onDetach; hook != nil {
+		hook(target)
+	}
 	return err
 }
 
@@ -123,6 +231,10 @@ func (f *fakeMounter) Unmount(_ context.Context, target string) error {
 	var err error
 	f.unmountErrs, err = next(f.unmountErrs)
 	f.unmountCalls = append(f.unmountCalls, target)
+	f.record("unmount:" + target)
+	if hook := f.onUnmount; hook != nil {
+		hook(target)
+	}
 	return err
 }
 
@@ -161,6 +273,9 @@ func (f *fakeMounter) VolumeMountState(target, volume, subdir string) (mounter.M
 	defer f.mu.Unlock()
 
 	f.mountStateCalls = append(f.mountStateCalls, mountStateCall{target: target, volume: volume, subdir: subdir})
+	if err, ok := f.mountStateErrOf[target]; ok {
+		return 0, err
+	}
 	if state, ok := f.mountStateOf[target]; ok {
 		return state, f.mountStateErr
 	}
@@ -919,6 +1034,405 @@ func TestNodeUnstageVolume(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestNodeStageVolumeRecord checks the staging record NodeStageVolume writes for
+// the recovery: its fields, the cases where it must not be written, and the
+// failure of the write itself.
+func TestNodeStageVolumeRecord(t *testing.T) {
+	tests := []struct {
+		name      string
+		mutate    func(t *testing.T, req *csi.NodeStageVolumeRequest, fake *fakeMounter, node *nodeService)
+		wantCode  codes.Code
+		wantMount int
+		// wantRecord is true when a record of the request must exist afterwards.
+		wantRecord bool
+		// check runs after the generic assertions.
+		check func(t *testing.T, rec stageRecord, fake *fakeMounter, staging string)
+	}{
+		{
+			name:       "a successful stage writes the record",
+			wantCode:   codes.OK,
+			wantMount:  1,
+			wantRecord: true,
+		},
+		{
+			name: "mount flags and the read-only flag are recorded",
+			mutate: func(_ *testing.T, req *csi.NodeStageVolumeRequest, _ *fakeMounter, _ *nodeService) {
+				req.VolumeCapability = accessModeCapability(
+					csi.VolumeCapability_AccessMode_MULTI_NODE_READER_ONLY, "acl", "log-level=INFO")
+			},
+			wantCode:   codes.OK,
+			wantMount:  1,
+			wantRecord: true,
+			check: func(t *testing.T, rec stageRecord, _ *fakeMounter, staging string) {
+				t.Helper()
+				if !rec.ReadOnly {
+					t.Error("ReadOnly = false, want true for MULTI_NODE_READER_ONLY")
+				}
+				if got := strings.Join(rec.MountFlags, ","); got != "acl,log-level=INFO" {
+					t.Errorf("MountFlags = %v, want the request mount flags", rec.MountFlags)
+				}
+				if rec.StagingTargetPath != staging {
+					t.Errorf("StagingTargetPath = %q, want %q", rec.StagingTargetPath, staging)
+				}
+				if len(rec.Targets) != 0 {
+					t.Errorf("Targets = %+v, want none after a successful stage", rec.Targets)
+				}
+			},
+		},
+		{
+			name: "a repeated stage rewrites the record and keeps one file",
+			mutate: func(_ *testing.T, _ *csi.NodeStageVolumeRequest, _ *fakeMounter, node *nodeService) {
+				// A left over target of an interrupted recovery that is no longer
+				// corrupted (the fake reports every path mounted) is dropped by the
+				// successful stage.
+				if err := node.records.save(stageRecord{
+					Version:           stageRecordVersion,
+					VolumeID:          testVolumeID,
+					StagingTargetPath: "/somewhere/else",
+					Targets:           []recordTarget{{Path: "/stale/target"}},
+				}); err != nil {
+					t.Fatalf("save() = %v, want nil", err)
+				}
+			},
+			wantCode:   codes.OK,
+			wantMount:  1,
+			wantRecord: true,
+			check: func(t *testing.T, rec stageRecord, _ *fakeMounter, _ string) {
+				t.Helper()
+				if len(rec.Targets) != 0 {
+					t.Errorf("Targets = %+v, want them cleared by the stage", rec.Targets)
+				}
+			},
+		},
+		{
+			name: "a corrupted staging mount keeps its bind targets and refreshes them",
+			mutate: func(t *testing.T, _ *csi.NodeStageVolumeRequest, fake *fakeMounter, node *nodeService) {
+				fake.mountErrs = []error{fmt.Errorf("%w: ENOTCONN", mounter.ErrCorruptedMount)}
+				fake.trackState = true
+				fake.mountStateOf = map[string]mounter.MountState{
+					testTarget1: mounter.MountStateCorrupted,
+					testTarget2: mounter.MountStateCorrupted,
+				}
+				fake.bindTargets = []mounter.BindTarget{{Path: testTarget1, ReadOnly: true}, {Path: testTarget2}}
+				// The targets must be on disk before the unmount removes the
+				// mountinfo entry that identifies them.
+				fake.onUnmount = func(string) {
+					rec, err := node.records.load(testVolumeID)
+					if err != nil {
+						t.Errorf("load() at the unmount = %v, want the saved record", err)
+						return
+					}
+					want := []recordTarget{{Path: testTarget1, ReadOnly: true}, {Path: testTarget2}}
+					if !slices.Equal(rec.Targets, want) {
+						t.Errorf("Targets at the unmount = %+v, want %+v", rec.Targets, want)
+					}
+				}
+			},
+			wantCode:   codes.OK,
+			wantMount:  2,
+			wantRecord: true,
+			check: func(t *testing.T, rec stageRecord, fake *fakeMounter, staging string) {
+				t.Helper()
+				want := []string{
+					"mount:" + staging,
+					"bindTargets:" + staging,
+					"unmount:" + staging,
+					"mount:" + staging,
+					"detach:" + testTarget1,
+					"bind:" + staging + "->" + testTarget1 + ":ro",
+					"detach:" + testTarget2,
+					"bind:" + staging + "->" + testTarget2 + ":rw",
+				}
+				if got := fake.callLog(); !slices.Equal(got, want) {
+					t.Errorf("calls = %q, want %q", got, want)
+				}
+				if len(rec.Targets) != 0 {
+					t.Errorf("Targets = %+v, want none after the refresh", rec.Targets)
+				}
+			},
+		},
+		{
+			name: "a target that cannot be bound again stays in the record",
+			mutate: func(_ *testing.T, _ *csi.NodeStageVolumeRequest, fake *fakeMounter, _ *nodeService) {
+				fake.mountErrs = []error{fmt.Errorf("%w: ENOTCONN", mounter.ErrCorruptedMount)}
+				fake.bindErrs = []error{errors.New("device busy")}
+				fake.trackState = true
+				fake.mountStateOf = map[string]mounter.MountState{
+					testTarget1: mounter.MountStateCorrupted,
+					testTarget2: mounter.MountStateCorrupted,
+				}
+				fake.bindTargets = []mounter.BindTarget{{Path: testTarget1, ReadOnly: true}, {Path: testTarget2}}
+			},
+			wantCode:   codes.OK,
+			wantMount:  2,
+			wantRecord: true,
+			check: func(t *testing.T, rec stageRecord, _ *fakeMounter, _ string) {
+				t.Helper()
+				want := []recordTarget{{Path: testTarget1, ReadOnly: true}}
+				if !slices.Equal(rec.Targets, want) {
+					t.Errorf("Targets = %+v, want %+v for the next recovery pass", rec.Targets, want)
+				}
+			},
+		},
+		{
+			name: "the targets of an interrupted recovery are refreshed by the stage",
+			mutate: func(t *testing.T, _ *csi.NodeStageVolumeRequest, fake *fakeMounter, node *nodeService) {
+				t.Helper()
+				fake.trackState = true
+				fake.mountStateOf = map[string]mounter.MountState{testTarget1: mounter.MountStateCorrupted}
+				if err := node.records.save(stageRecord{
+					Version:           stageRecordVersion,
+					VolumeID:          testVolumeID,
+					StagingTargetPath: testStaging,
+					Targets:           []recordTarget{{Path: testTarget1}},
+				}); err != nil {
+					t.Fatalf("save() = %v, want nil", err)
+				}
+			},
+			wantCode:   codes.OK,
+			wantMount:  1,
+			wantRecord: true,
+			check: func(t *testing.T, rec stageRecord, fake *fakeMounter, staging string) {
+				t.Helper()
+				want := []string{
+					"mount:" + staging,
+					"detach:" + testTarget1,
+					"bind:" + staging + "->" + testTarget1 + ":rw",
+				}
+				if got := fake.callLog(); !slices.Equal(got, want) {
+					t.Errorf("calls = %q, want %q", got, want)
+				}
+				if len(rec.Targets) != 0 {
+					t.Errorf("Targets = %+v, want none after the refresh", rec.Targets)
+				}
+			},
+		},
+		{
+			name: "bind targets that cannot be read do not fail the stage",
+			mutate: func(_ *testing.T, _ *csi.NodeStageVolumeRequest, fake *fakeMounter, _ *nodeService) {
+				fake.mountErrs = []error{fmt.Errorf("%w: ENOTCONN", mounter.ErrCorruptedMount)}
+				fake.bindTargetsErrs = []error{errors.New("no mountinfo")}
+			},
+			wantCode:   codes.OK,
+			wantMount:  2,
+			wantRecord: true,
+			check: func(t *testing.T, rec stageRecord, fake *fakeMounter, _ string) {
+				t.Helper()
+				if got := fake.unmountCount(); got != 1 {
+					t.Errorf("Unmount calls = %d, want 1", got)
+				}
+				if len(rec.Targets) != 0 {
+					t.Errorf("Targets = %+v, want none", rec.Targets)
+				}
+			},
+		},
+		{
+			name: "bind targets that cannot be recorded stop before the unmount",
+			mutate: func(t *testing.T, _ *csi.NodeStageVolumeRequest, fake *fakeMounter, node *nodeService) {
+				t.Helper()
+				fake.mountErrs = []error{fmt.Errorf("%w: ENOTCONN", mounter.ErrCorruptedMount)}
+				fake.bindTargets = []mounter.BindTarget{{Path: testTarget1}}
+				file := filepath.Join(t.TempDir(), "file")
+				if err := os.WriteFile(file, nil, 0o600); err != nil {
+					t.Fatalf("WriteFile() = %v, want nil", err)
+				}
+				node.records = &recordStore{dir: filepath.Join(file, "staged")}
+			},
+			wantCode:  codes.Internal,
+			wantMount: 1,
+			check: func(t *testing.T, _ stageRecord, fake *fakeMounter, _ string) {
+				t.Helper()
+				if got := fake.unmountCount(); got != 0 {
+					t.Errorf("Unmount calls = %d, want 0: the targets would be lost", got)
+				}
+			},
+		},
+		{
+			name: "a failed mount writes no record",
+			mutate: func(_ *testing.T, _ *csi.NodeStageVolumeRequest, fake *fakeMounter, _ *nodeService) {
+				fake.mountErrs = []error{errors.New("gluster is down")}
+			},
+			wantCode:  codes.Internal,
+			wantMount: 1,
+		},
+		{
+			name: "an unwritable state directory is Internal",
+			mutate: func(t *testing.T, _ *csi.NodeStageVolumeRequest, _ *fakeMounter, node *nodeService) {
+				t.Helper()
+				file := filepath.Join(t.TempDir(), "file")
+				if err := os.WriteFile(file, nil, 0o600); err != nil {
+					t.Fatalf("WriteFile() = %v, want nil", err)
+				}
+				node.records = &recordStore{dir: filepath.Join(file, "staged")}
+			},
+			wantCode:  codes.Internal,
+			wantMount: 1,
+			// The mount is kept: repeating the request only rewrites the record.
+			check: func(t *testing.T, _ stageRecord, fake *fakeMounter, _ string) {
+				t.Helper()
+				if got := fake.unmountCount(); got != 0 {
+					t.Errorf("Unmount calls = %d, want 0: the successful mount must be kept", got)
+				}
+			},
+		},
+		{
+			name: "no state directory writes no record",
+			mutate: func(_ *testing.T, _ *csi.NodeStageVolumeRequest, _ *fakeMounter, node *nodeService) {
+				node.records = nil
+			},
+			wantCode:  codes.OK,
+			wantMount: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			node, fake := newTestNode(t)
+			store := newTestRecordStore(t)
+			node.records = store
+			staging := tempPathOf(t, "staging")
+
+			req := &csi.NodeStageVolumeRequest{
+				VolumeId:          testVolumeID,
+				StagingTargetPath: staging,
+				VolumeCapability:  mountCapability,
+			}
+			if tc.mutate != nil {
+				tc.mutate(t, req, fake, node)
+			}
+
+			_, err := node.NodeStageVolume(context.Background(), req)
+			wantCode(t, err, tc.wantCode)
+			if got := fake.mountCount(); got != tc.wantMount {
+				t.Fatalf("MountGlusterfs calls = %d, want %d", got, tc.wantMount)
+			}
+
+			names, listErr := store.list()
+			if listErr != nil {
+				t.Fatalf("list() = %v, want nil", listErr)
+			}
+			if !tc.wantRecord {
+				if len(names) != 0 {
+					t.Fatalf("records = %v, want none", names)
+				}
+				return
+			}
+			if len(names) != 1 {
+				t.Fatalf("records = %v, want exactly one", names)
+			}
+			rec, loadErr := store.load(req.GetVolumeId())
+			if loadErr != nil {
+				t.Fatalf("load() = %v, want nil", loadErr)
+			}
+			if rec.Version != stageRecordVersion || rec.VolumeID != testVolumeID {
+				t.Fatalf("record = %+v, want version %d of volume %s", rec, stageRecordVersion, testVolumeID)
+			}
+			if tc.check != nil {
+				tc.check(t, rec, fake, staging)
+			}
+		})
+	}
+}
+
+// TestNodeUnstageVolumeRecord checks that NodeUnstageVolume removes the staging
+// record only after a successful unmount.
+func TestNodeUnstageVolumeRecord(t *testing.T) {
+	tests := []struct {
+		name string
+		// noRecord starts without a record.
+		noRecord  bool
+		unmountEr error
+		wantCode  codes.Code
+		// wantRecord is true when the record must still be there afterwards.
+		wantRecord bool
+	}{
+		{name: "a successful unstage removes the record", wantCode: codes.OK},
+		{name: "a failed unmount keeps the record", unmountEr: errors.New("device busy"), wantCode: codes.Internal, wantRecord: true},
+		{name: "an unstage without a record is idempotent", noRecord: true, wantCode: codes.OK},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			node, fake := newTestNode(t)
+			store := newTestRecordStore(t)
+			node.records = store
+			staging := tempPathOf(t, "staging")
+
+			req := &csi.NodeUnstageVolumeRequest{VolumeId: testVolumeID, StagingTargetPath: staging}
+			if !tc.noRecord {
+				rec := stageRecord{
+					Version:           stageRecordVersion,
+					VolumeID:          testVolumeID,
+					StagingTargetPath: staging,
+				}
+				if err := store.save(rec); err != nil {
+					t.Fatalf("save() = %v, want nil", err)
+				}
+			}
+			if tc.unmountEr != nil {
+				fake.unmountErrs = []error{tc.unmountEr}
+			}
+
+			_, err := node.NodeUnstageVolume(context.Background(), req)
+			wantCode(t, err, tc.wantCode)
+
+			_, loadErr := store.load(testVolumeID)
+			if tc.wantRecord {
+				if loadErr != nil {
+					t.Fatalf("load() = %v, want the record to be kept", loadErr)
+				}
+			} else if !errors.Is(loadErr, os.ErrNotExist) {
+				t.Fatalf("load() = %v, want the record to be gone", loadErr)
+			}
+
+			// The repetition of an idempotent unstage succeeds in both cases.
+			if !tc.wantRecord {
+				_, err := node.NodeUnstageVolume(context.Background(), req)
+				wantCode(t, err, codes.OK)
+			}
+		})
+	}
+
+	t.Run("no state directory removes nothing", func(t *testing.T) {
+		node, _ := newTestNode(t)
+		node.records = nil
+
+		_, err := node.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{
+			VolumeId:          testVolumeID,
+			StagingTargetPath: tempPathOf(t, "staging"),
+		})
+		wantCode(t, err, codes.OK)
+	})
+
+	t.Run("a removal failure is Internal", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root can remove a file from a read-only directory")
+		}
+		node, _ := newTestNode(t)
+		store := newTestRecordStore(t)
+		node.records = store
+		staging := tempPathOf(t, "staging")
+		rec := stageRecord{
+			Version:           stageRecordVersion,
+			VolumeID:          testVolumeID,
+			StagingTargetPath: staging,
+		}
+		if err := store.save(rec); err != nil {
+			t.Fatalf("save() = %v, want nil", err)
+		}
+		if err := os.Chmod(store.dir, 0o500); err != nil {
+			t.Fatalf("Chmod() = %v, want nil", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(store.dir, recordDirMode) })
+
+		_, err := node.NodeUnstageVolume(context.Background(), &csi.NodeUnstageVolumeRequest{
+			VolumeId:          testVolumeID,
+			StagingTargetPath: staging,
+		})
+		wantCode(t, err, codes.Internal)
+	})
 }
 
 func TestNodePublishVolume(t *testing.T) {

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"k8s.io/klog/v2"
 
@@ -34,6 +35,13 @@ const (
 	DefaultConfigPath = "/etc/glusterfs-csi/config.json"
 	// DefaultMountLogDir is the default directory of the per-volume mount logs.
 	DefaultMountLogDir = "/var/log/glusterfs/csi"
+	// DefaultStateDir is the default directory of the staging records. It lives
+	// in the kubelet plugin directory, which the DaemonSet already mounts as a
+	// volume and which survives a restart of the plugin container (D-20).
+	DefaultStateDir = "/var/lib/kubelet/plugins/glusterfs.csi.io/staged"
+	// DefaultRecoveryInterval is how often the mount recovery runs after the pass
+	// at startup.
+	DefaultRecoveryInterval = 60 * time.Second
 )
 
 // usageError wraps an error that the flag package already reported on its own
@@ -46,13 +54,15 @@ func (e *usageError) Unwrap() error { return e.err }
 
 // options holds the values of the command line flags.
 type options struct {
-	endpoint    string
-	nodeID      string
-	mode        string
-	driverName  string
-	configPath  string
-	mountLogDir string
-	showVer     bool
+	endpoint         string
+	nodeID           string
+	mode             string
+	driverName       string
+	configPath       string
+	mountLogDir      string
+	stateDir         string
+	recoveryInterval time.Duration
+	showVer          bool
 }
 
 // validateFlags checks the parsed command line flags.
@@ -103,6 +113,22 @@ func validateFlags(opts options) error {
 		}
 	}
 
+	// An empty value disables the staging records and the mount recovery; anything
+	// else becomes a directory the driver creates and writes into.
+	if opts.stateDir != "" {
+		if !filepath.IsAbs(opts.stateDir) {
+			return fmt.Errorf("invalid --state-dir: %q must be an absolute path", opts.stateDir)
+		}
+		if filepath.Clean(opts.stateDir) != opts.stateDir {
+			return fmt.Errorf("invalid --state-dir: %q must be a clean path", opts.stateDir)
+		}
+	}
+	// 0 is allowed and means "only at startup"; a negative interval would make
+	// time.NewTicker panic.
+	if opts.recoveryInterval < 0 {
+		return fmt.Errorf("invalid --recovery-interval: %s must not be negative", opts.recoveryInterval)
+	}
+
 	return nil
 }
 
@@ -121,6 +147,10 @@ func parseFlags(args []string, output io.Writer) (options, error) {
 	fs.StringVar(&opts.configPath, "config", DefaultConfigPath, "Path of the cluster configuration file")
 	fs.StringVar(&opts.mountLogDir, "mount-log-dir", DefaultMountLogDir,
 		"Directory of the per-volume glusterfs mount logs; an empty value disables the log-file mount option")
+	fs.StringVar(&opts.stateDir, "state-dir", DefaultStateDir,
+		"Directory of the staging records the mount recovery works from; an empty value disables the records and the recovery")
+	fs.DurationVar(&opts.recoveryInterval, "recovery-interval", DefaultRecoveryInterval,
+		"How often the mount recovery scans the staging records; 0 scans at startup only")
 	fs.BoolVar(&opts.showVer, "version", false, "Print the version and exit")
 
 	klog.InitFlags(fs)
@@ -191,13 +221,15 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}()
 
 	d, err := driver.New(driver.Options{
-		DriverName:  opts.driverName,
-		NodeID:      opts.nodeID,
-		Endpoint:    opts.endpoint,
-		Mode:        mode,
-		Version:     version.Get().Version,
-		Config:      store,
-		MountLogDir: opts.mountLogDir,
+		DriverName:       opts.driverName,
+		NodeID:           opts.nodeID,
+		Endpoint:         opts.endpoint,
+		Mode:             mode,
+		Version:          version.Get().Version,
+		Config:           store,
+		MountLogDir:      opts.mountLogDir,
+		StateDir:         opts.stateDir,
+		RecoveryInterval: opts.recoveryInterval,
 	})
 	if err != nil {
 		return err
@@ -205,6 +237,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 	klog.InfoS("glusterfs-csi starting", "mode", opts.mode, "nodeID", opts.nodeID,
 		"driverName", opts.driverName, "endpoint", opts.endpoint, "mountLogDir", opts.mountLogDir,
+		"stateDir", opts.stateDir, "recoveryInterval", opts.recoveryInterval.String(),
 		"version", version.Get().Version)
 
 	return d.Run(ctx)

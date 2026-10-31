@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,12 +20,14 @@ const validConfig = `[{"clusterID":"prod","servers":["gluster-1","10.0.0.13"]}]`
 
 func validOptions() options {
 	return options{
-		endpoint:    DefaultEndpoint,
-		nodeID:      "node-1",
-		mode:        string(driver.ModeAll),
-		driverName:  DriverName,
-		configPath:  DefaultConfigPath,
-		mountLogDir: DefaultMountLogDir,
+		endpoint:         DefaultEndpoint,
+		nodeID:           "node-1",
+		mode:             string(driver.ModeAll),
+		driverName:       DriverName,
+		configPath:       DefaultConfigPath,
+		mountLogDir:      DefaultMountLogDir,
+		stateDir:         DefaultStateDir,
+		recoveryInterval: DefaultRecoveryInterval,
 	}
 }
 
@@ -174,6 +177,38 @@ func TestValidateFlags(t *testing.T) {
 			name:   "empty mount log dir disables the log file",
 			mutate: func(o *options) { o.mountLogDir = "" },
 		},
+		{
+			name:    "relative state dir",
+			mutate:  func(o *options) { o.stateDir = "staged" },
+			wantErr: "invalid --state-dir",
+		},
+		{
+			name:    "unclean state dir",
+			mutate:  func(o *options) { o.stateDir = "/a/../b" },
+			wantErr: "invalid --state-dir",
+		},
+		{
+			name:    "state dir with a trailing slash",
+			mutate:  func(o *options) { o.stateDir = "/staged/" },
+			wantErr: "invalid --state-dir",
+		},
+		{
+			name:   "empty state dir disables the records and the recovery",
+			mutate: func(o *options) { o.stateDir = "" },
+		},
+		{
+			name:    "negative recovery interval",
+			mutate:  func(o *options) { o.recoveryInterval = -time.Second },
+			wantErr: "invalid --recovery-interval",
+		},
+		{
+			name:   "zero recovery interval scans at startup only",
+			mutate: func(o *options) { o.recoveryInterval = 0 },
+		},
+		{
+			name:   "a long recovery interval",
+			mutate: func(o *options) { o.recoveryInterval = 24 * time.Hour },
+		},
 	}
 
 	for _, tc := range tests {
@@ -210,11 +245,13 @@ func TestParseFlags(t *testing.T) {
 			name: "defaults",
 			args: nil,
 			want: options{
-				endpoint:    DefaultEndpoint,
-				mode:        string(driver.ModeAll),
-				driverName:  DriverName,
-				configPath:  DefaultConfigPath,
-				mountLogDir: DefaultMountLogDir,
+				endpoint:         DefaultEndpoint,
+				mode:             string(driver.ModeAll),
+				driverName:       DriverName,
+				configPath:       DefaultConfigPath,
+				mountLogDir:      DefaultMountLogDir,
+				stateDir:         DefaultStateDir,
+				recoveryInterval: DefaultRecoveryInterval,
 			},
 		},
 		{
@@ -226,26 +263,48 @@ func TestParseFlags(t *testing.T) {
 				"--drivername=example.csi.io",
 				"--config=/tmp/config.json",
 				"--mount-log-dir=/tmp/logs",
+				"--state-dir=/tmp/staged",
+				"--recovery-interval=90s",
 			},
 			want: options{
-				endpoint:    "tcp://127.0.0.1:10000",
-				nodeID:      "node-1",
-				mode:        string(driver.ModeNode),
-				driverName:  "example.csi.io",
-				configPath:  "/tmp/config.json",
-				mountLogDir: "/tmp/logs",
+				endpoint:         "tcp://127.0.0.1:10000",
+				nodeID:           "node-1",
+				mode:             string(driver.ModeNode),
+				driverName:       "example.csi.io",
+				configPath:       "/tmp/config.json",
+				mountLogDir:      "/tmp/logs",
+				stateDir:         "/tmp/staged",
+				recoveryInterval: 90 * time.Second,
 			},
 		},
 		{
-			name: "version flag",
-			args: []string{"--version"},
+			name: "an empty state dir and a zero interval",
+			args: []string{"--state-dir=", "--recovery-interval=0"},
 			want: options{
 				endpoint:    DefaultEndpoint,
 				mode:        string(driver.ModeAll),
 				driverName:  DriverName,
 				configPath:  DefaultConfigPath,
 				mountLogDir: DefaultMountLogDir,
-				showVer:     true,
+			},
+		},
+		{
+			name:    "a recovery interval without a unit",
+			args:    []string{"--recovery-interval=60"},
+			wantErr: true,
+		},
+		{
+			name: "version flag",
+			args: []string{"--version"},
+			want: options{
+				endpoint:         DefaultEndpoint,
+				mode:             string(driver.ModeAll),
+				driverName:       DriverName,
+				configPath:       DefaultConfigPath,
+				mountLogDir:      DefaultMountLogDir,
+				stateDir:         DefaultStateDir,
+				recoveryInterval: DefaultRecoveryInterval,
+				showVer:          true,
 			},
 		},
 		{
@@ -470,6 +529,16 @@ func TestRunInvalidFlags(t *testing.T) {
 			wantErr: "invalid --mount-log-dir",
 		},
 		{
+			name:    "relative state dir",
+			args:    []string{"--mode=controller", "--state-dir=staged"},
+			wantErr: "invalid --state-dir",
+		},
+		{
+			name:    "negative recovery interval",
+			args:    []string{"--mode=controller", "--recovery-interval=-1s"},
+			wantErr: "invalid --recovery-interval",
+		},
+		{
 			name:     "unknown flag",
 			args:     []string{"--bogus"},
 			parseErr: true,
@@ -497,5 +566,60 @@ func TestRunInvalidFlags(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestDefaultRecoveryFlags checks the documented defaults of the two recovery
+// flags (D-20): the staging record directory below the kubelet plugin directory
+// and a 60s interval.
+func TestDefaultRecoveryFlags(t *testing.T) {
+	if DefaultStateDir != "/var/lib/kubelet/plugins/glusterfs.csi.io/staged" {
+		t.Fatalf("DefaultStateDir = %q, want the kubelet plugin directory", DefaultStateDir)
+	}
+	if DefaultRecoveryInterval != 60*time.Second {
+		t.Fatalf("DefaultRecoveryInterval = %s, want 60s", DefaultRecoveryInterval)
+	}
+
+	opts, err := parseFlags(nil, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags() = %v, want nil", err)
+	}
+	if opts.stateDir != DefaultStateDir {
+		t.Fatalf("stateDir = %q, want %q", opts.stateDir, DefaultStateDir)
+	}
+	if opts.recoveryInterval != DefaultRecoveryInterval {
+		t.Fatalf("recoveryInterval = %s, want %s", opts.recoveryInterval, DefaultRecoveryInterval)
+	}
+}
+
+// TestRunRecoveryFlags checks that the two flags reach the driver: a state
+// directory the recovery can use and a zero interval, both accepted at startup.
+func TestRunRecoveryFlags(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{
+			"--mode=node",
+			"--nodeid=node-1",
+			"--endpoint=tcp://127.0.0.1:0",
+			"--config=" + writeConfig(t, validConfig),
+			"--state-dir=" + filepath.Join(t.TempDir(), "staged"),
+			"--recovery-interval=0",
+		}, &stdout, &stderr)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run() = %v, want nil after cancellation (stderr: %q)", err, stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run() did not return within 2s of cancellation")
 	}
 }

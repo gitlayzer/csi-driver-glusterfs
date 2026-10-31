@@ -86,6 +86,15 @@ func (s MountState) String() string {
 	}
 }
 
+// BindTarget is a mount point that shows the file system of another mount
+// point.
+type BindTarget struct {
+	// Path is the mount point, absolute and clean.
+	Path string
+	// ReadOnly is true when the per-mount options contain "ro".
+	ReadOnly bool
+}
+
 // Mounter mounts and unmounts GlusterFS volumes. Every method is idempotent:
 // repeating a successful call succeeds with the same result, which is what the
 // CSI idempotency requirements demand.
@@ -120,6 +129,16 @@ type Mounter interface {
 	// of a staging path other than one target path. NodePublishVolume uses it
 	// to refuse a second target of a single node access mode.
 	OtherBindMounts(source, except string) ([]string, error)
+	// BindTargets returns the other mount points of the file system mounted at
+	// source, read from mountinfo: same major:minor and same root. Unlike
+	// OtherBindMounts it works when source is a corrupted mount point, which is
+	// when the recovery needs it. A source that is not a mount point returns an
+	// empty list.
+	BindTargets(source string) ([]BindTarget, error)
+	// Detach lazily unmounts target (MNT_DETACH), which succeeds even while
+	// processes still use the dead mount. A target that does not exist or is not
+	// a mount point is success.
+	Detach(target string) error
 }
 
 // mounter is the container local implementation of [Mounter]. The FUSE process
@@ -131,6 +150,14 @@ type mounter struct {
 	inner mount.Interface
 	// logDir is the directory of the per-mount log file, empty for none.
 	logDir string
+	// mountInfoPath is the mount table [Mounter.BindTargets] reads. Production
+	// uses [procMountInfoPath]; it is a field so that a test can point it at a
+	// fixture under a temporary directory.
+	mountInfoPath string
+	// detach performs the lazy unmount of [Mounter.Detach]. Production uses the
+	// platform implementation; it is a field so that a test can record the calls
+	// instead of unmounting something on the test machine.
+	detach func(target string) error
 }
 
 // The compiler has to reject any drift between the interface and the
@@ -141,7 +168,12 @@ var _ Mounter = (*mounter)(nil)
 // logDir. Production passes mount.New(""), tests pass mount.NewFakeMounter.
 // New performs no I/O; logDir is handed to [BuildMountArgs] unchanged.
 func New(m mount.Interface, logDir string) Mounter {
-	return &mounter{inner: m, logDir: logDir}
+	return &mounter{
+		inner:         m,
+		logDir:        logDir,
+		mountInfoPath: procMountInfoPath,
+		detach:        detachMount,
+	}
 }
 
 // MountGlusterfs mounts spec at target with a glusterfs FUSE mount.
@@ -389,6 +421,22 @@ func (m *mounter) OtherBindMounts(source, except string) ([]string, error) {
 		}
 	}
 	return others, nil
+}
+
+// Detach implements [Mounter.Detach].
+//
+// A lazy unmount is used because the recovery detaches a mount whose file system
+// is dead: an ordinary unmount fails with EBUSY as long as any process of a Pod
+// still has the dead mount in its mount namespace.
+func (m *mounter) Detach(target string) error {
+	if err := validatePath("target", target); err != nil {
+		return err
+	}
+	if err := m.detach(target); err != nil {
+		return err
+	}
+	klog.V(2).InfoS("detached mount", "target", target)
+	return nil
 }
 
 // VolumeMountState implements [Mounter.VolumeMountState].

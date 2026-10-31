@@ -17,6 +17,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"k8s.io/klog/v2"
@@ -121,6 +123,12 @@ type Options struct {
 	// MountLogDir is the directory of the per-volume glusterfs mount logs; empty
 	// disables log-file.
 	MountLogDir string
+	// StateDir is the directory of the staging records the mount recovery works
+	// from. Empty disables the records and with them the recovery (D-20).
+	StateDir string
+	// RecoveryInterval is how often the recovery pass is repeated after the one at
+	// startup. 0 means "only at startup"; a negative value is an error.
+	RecoveryInterval time.Duration
 }
 
 // Driver is the CSI plugin. It implements the Identity service and, once later
@@ -152,6 +160,10 @@ type Driver struct {
 
 	// nodeRegistered is true when the Node service is registered.
 	nodeRegistered bool
+
+	// recoveryInterval is how often the node service repeats its recovery pass
+	// once the gRPC server runs. It is only used in node and all mode.
+	recoveryInterval time.Duration
 
 	// checks are the Probe readiness checks of the current mode.
 	checks []check
@@ -195,6 +207,12 @@ func New(opts Options) (*Driver, error) {
 	if err := validateMountLogDir(opts.MountLogDir); err != nil {
 		return nil, err
 	}
+	if err := validateStateDir(opts.StateDir); err != nil {
+		return nil, err
+	}
+	if opts.RecoveryInterval < 0 {
+		return nil, fmt.Errorf("invalid recovery interval %s: must not be negative", opts.RecoveryInterval)
+	}
 
 	version := opts.Version
 	if strings.TrimSpace(version) == "" {
@@ -202,14 +220,15 @@ func New(opts Options) (*Driver, error) {
 	}
 
 	d := &Driver{
-		driverName: opts.DriverName,
-		nodeID:     opts.NodeID,
-		mode:       mode,
-		version:    version,
-		config:     opts.Config,
-		endpoint:   opts.Endpoint,
-		stat:       os.Stat,
-		lookPath:   exec.LookPath,
+		driverName:       opts.DriverName,
+		nodeID:           opts.NodeID,
+		mode:             mode,
+		version:          version,
+		config:           opts.Config,
+		endpoint:         opts.Endpoint,
+		recoveryInterval: opts.RecoveryInterval,
+		stat:             os.Stat,
+		lookPath:         exec.LookPath,
 	}
 	d.identityService = identityService{driver: d}
 	d.checks = d.readinessChecks()
@@ -223,11 +242,15 @@ func New(opts Options) (*Driver, error) {
 			stat:    os.Stat,
 			statFS:  statFS,
 		}
+		if opts.StateDir != "" {
+			d.node.records = &recordStore{dir: opts.StateDir}
+		}
 		d.nodeRegistered = true
 	}
 
 	klog.V(2).InfoS("glusterfs-csi driver initialised",
-		"driverName", d.driverName, "mode", string(d.mode), "version", d.version)
+		"driverName", d.driverName, "mode", string(d.mode), "version", d.version,
+		"stateDir", opts.StateDir, "recoveryInterval", opts.RecoveryInterval.String())
 
 	return d, nil
 }
@@ -281,6 +304,13 @@ func (d *Driver) Serve(ctx context.Context, lis net.Listener) error {
 		serveErr <- srv.Serve(lis)
 	}()
 
+	// The recovery runs next to the gRPC server, not before it: it must not delay
+	// the first RPC of kubelet. Its context is derived from ctx and cancelled on
+	// every return path below, and the wait group makes the return wait for the
+	// pass that is still running.
+	stopRecovery := d.startRecovery(ctx)
+	defer stopRecovery()
+
 	select {
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, grpc.ErrServerStopped) {
@@ -300,6 +330,37 @@ func (d *Driver) Serve(ctx context.Context, lis net.Listener) error {
 	return nil
 }
 
+// startRecovery starts the mount recovery of the node service in the background
+// and returns the function that stops it and waits for it to return.
+//
+// The returned stop function is idempotent, so a caller can defer it and still
+// call it explicitly on the shutdown path. Without a node service or without a
+// state directory (--state-dir is empty) no goroutine is started at all (D-20).
+func (d *Driver) startRecovery(ctx context.Context) (stop func()) {
+	if d.node == nil || d.node.records == nil {
+		return func() {}
+	}
+
+	recoveryCtx, cancel := context.WithCancel(ctx)
+
+	var (
+		once sync.Once
+		wg   sync.WaitGroup
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		d.node.runRecovery(recoveryCtx, d.recoveryInterval)
+	}()
+
+	return func() {
+		once.Do(func() {
+			cancel()
+			wg.Wait()
+		})
+	}
+}
+
 // validateMountLogDir validates Options.MountLogDir. An empty value disables the
 // mount log file and is always accepted; anything else is used in a path, so it
 // has to be absolute and clean instead of being normalized silently.
@@ -311,6 +372,22 @@ func validateMountLogDir(dir string) error {
 		return fmt.Errorf("invalid mount log directory %q: must be an absolute path", dir)
 	case filepath.Clean(dir) != dir:
 		return fmt.Errorf("invalid mount log directory %q: must be a clean path", dir)
+	}
+	return nil
+}
+
+// validateStateDir validates Options.StateDir. An empty value disables the
+// staging records and the recovery and is always accepted; anything else becomes
+// a directory the driver creates and writes into, so it has to be absolute and
+// clean instead of being normalized silently.
+func validateStateDir(dir string) error {
+	switch {
+	case dir == "":
+		return nil
+	case !filepath.IsAbs(dir):
+		return fmt.Errorf("invalid state directory %q: must be an absolute path", dir)
+	case filepath.Clean(dir) != dir:
+		return fmt.Errorf("invalid state directory %q: must be a clean path", dir)
 	}
 	return nil
 }
