@@ -17,3 +17,5 @@
 | D-11 | 与远程初始提交合并 | 本地提交变基到远程 `Initial commit`（含 GitHub 生成的 LICENSE）之上，不强推 | |
 | D-12 | Gluster 节点命名 | 以主机名为准（peer、brick 均用主机名），不改主机名；各节点 `/etc/hosts` 写入映射：dxt-gluster-node-1=192.168.129.2、node-2=192.168.129.3、node-3=192.168.129.1 | IP 顺序与主机名不对应属正常 |
 | D-13 | GlusterFS 服务端版本 | Ubuntu 24.04 自带 11.1（apt `glusterfs-server`） | 兼容性测试另覆盖 9/10/11 |
+| D-14 | Go 最低版本（`go.mod` 的 `go` 指令） | 1.26 | 跟随 Go 官方仍在维护的最老版本；CI 与镜像构建使用最新稳定版（当前 1.27） |
+| D-15 | Dependabot 依赖升级 PR | 由架构师处理：`@dependabot rebase` 等指令 → 本地跑完整门禁 → CI 全绿 → 在对话中告知 → squash 合并 | 涉及 `go.mod` 的多个 PR 逐个合并，后续 PR 由 Dependabot 自动变基 |
