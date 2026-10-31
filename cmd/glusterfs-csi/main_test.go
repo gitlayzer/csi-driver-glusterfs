@@ -19,11 +19,12 @@ const validConfig = `[{"clusterID":"prod","servers":["gluster-1","10.0.0.13"]}]`
 
 func validOptions() options {
 	return options{
-		endpoint:   DefaultEndpoint,
-		nodeID:     "node-1",
-		mode:       string(driver.ModeAll),
-		driverName: DriverName,
-		configPath: DefaultConfigPath,
+		endpoint:    DefaultEndpoint,
+		nodeID:      "node-1",
+		mode:        string(driver.ModeAll),
+		driverName:  DriverName,
+		configPath:  DefaultConfigPath,
+		mountLogDir: DefaultMountLogDir,
 	}
 }
 
@@ -159,6 +160,20 @@ func TestValidateFlags(t *testing.T) {
 			mutate:  func(o *options) { o.configPath = "" },
 			wantErr: "--config must not be empty",
 		},
+		{
+			name:    "relative mount log dir",
+			mutate:  func(o *options) { o.mountLogDir = "relative" },
+			wantErr: "invalid --mount-log-dir",
+		},
+		{
+			name:    "unclean mount log dir",
+			mutate:  func(o *options) { o.mountLogDir = "/a/../b" },
+			wantErr: "invalid --mount-log-dir",
+		},
+		{
+			name:   "empty mount log dir disables the log file",
+			mutate: func(o *options) { o.mountLogDir = "" },
+		},
 	}
 
 	for _, tc := range tests {
@@ -195,10 +210,11 @@ func TestParseFlags(t *testing.T) {
 			name: "defaults",
 			args: nil,
 			want: options{
-				endpoint:   DefaultEndpoint,
-				mode:       string(driver.ModeAll),
-				driverName: DriverName,
-				configPath: DefaultConfigPath,
+				endpoint:    DefaultEndpoint,
+				mode:        string(driver.ModeAll),
+				driverName:  DriverName,
+				configPath:  DefaultConfigPath,
+				mountLogDir: DefaultMountLogDir,
 			},
 		},
 		{
@@ -209,24 +225,27 @@ func TestParseFlags(t *testing.T) {
 				"--mode=node",
 				"--drivername=example.csi.io",
 				"--config=/tmp/config.json",
+				"--mount-log-dir=/tmp/logs",
 			},
 			want: options{
-				endpoint:   "tcp://127.0.0.1:10000",
-				nodeID:     "node-1",
-				mode:       string(driver.ModeNode),
-				driverName: "example.csi.io",
-				configPath: "/tmp/config.json",
+				endpoint:    "tcp://127.0.0.1:10000",
+				nodeID:      "node-1",
+				mode:        string(driver.ModeNode),
+				driverName:  "example.csi.io",
+				configPath:  "/tmp/config.json",
+				mountLogDir: "/tmp/logs",
 			},
 		},
 		{
 			name: "version flag",
 			args: []string{"--version"},
 			want: options{
-				endpoint:   DefaultEndpoint,
-				mode:       string(driver.ModeAll),
-				driverName: DriverName,
-				configPath: DefaultConfigPath,
-				showVer:    true,
+				endpoint:    DefaultEndpoint,
+				mode:        string(driver.ModeAll),
+				driverName:  DriverName,
+				configPath:  DefaultConfigPath,
+				mountLogDir: DefaultMountLogDir,
+				showVer:     true,
 			},
 		},
 		{
@@ -324,6 +343,37 @@ func TestRunServesUntilCancelled(t *testing.T) {
 	}
 }
 
+// TestRunEmptyMountLogDir checks that an empty --mount-log-dir is accepted: it
+// disables the log-file mount option instead of being rejected.
+func TestRunEmptyMountLogDir(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{
+			"--mode=node",
+			"--nodeid=node-1",
+			"--endpoint=tcp://127.0.0.1:0",
+			"--config=" + writeConfig(t, validConfig),
+			"--mount-log-dir=",
+		}, &stdout, &stderr)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run() = %v, want nil after cancellation (stderr: %q)", err, stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run() did not return within 2s of cancellation")
+	}
+}
+
 // TestRunConfigErrors checks that a broken configuration fails the start
 // instead of leaving a running plugin without any cluster.
 func TestRunConfigErrors(t *testing.T) {
@@ -408,6 +458,16 @@ func TestRunInvalidFlags(t *testing.T) {
 			name:    "invalid drivername",
 			args:    []string{"--mode=controller", "--drivername=_abc"},
 			wantErr: "invalid --drivername",
+		},
+		{
+			name:    "relative mount log dir",
+			args:    []string{"--mode=controller", "--mount-log-dir=relative"},
+			wantErr: "invalid --mount-log-dir",
+		},
+		{
+			name:    "unclean mount log dir",
+			args:    []string{"--mode=controller", "--mount-log-dir=/a/../b"},
+			wantErr: "invalid --mount-log-dir",
 		},
 		{
 			name:     "unknown flag",

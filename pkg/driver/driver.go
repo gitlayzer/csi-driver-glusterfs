@@ -1,11 +1,11 @@
 // Package driver implements the CSI plugin: the gRPC server, the Identity
 // service and the process lifecycle of the glusterfs-csi binary.
 //
-// The package is deliberately thin. The Controller and Node services are added
-// by later tasks; they register themselves on the same [Driver] and are reached
-// through the same gRPC server, so the plugin capability list is derived from
-// what is actually registered instead of being hard-coded
-// (docs/architecture.md §5.4).
+// The package is deliberately thin. The Controller service is added by a later
+// task; the Controller and Node services register themselves on the same
+// [Driver] and are reached through the same gRPC server, so the plugin
+// capability list is derived from what is actually registered instead of being
+// hard-coded (docs/architecture.md §5.4).
 package driver
 
 import (
@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"google.golang.org/grpc"
@@ -113,13 +114,18 @@ type Options struct {
 	Mode Mode
 	// Version is the build version, normally version.Get().Version.
 	Version string
-	// Config is the live cluster configuration. T-04 only stores it; the
-	// Controller service reads it and main keeps it up to date.
+	// Config is the live cluster configuration. The Node and Controller
+	// services read it and main keeps it up to date. It is required in node and
+	// all mode, because NodeStageVolume needs the servers of a cluster.
 	Config *config.Store
+	// MountLogDir is the directory of the per-volume glusterfs mount logs; empty
+	// disables log-file.
+	MountLogDir string
 }
 
 // Driver is the CSI plugin. It implements the Identity service and, once later
-// tasks add them, the Controller and Node services.
+// tasks add it, the Controller service; the Node service is registered through
+// the node field in node and all mode.
 //
 // A Driver is safe for concurrent use: the registration flags are only written
 // before the gRPC server starts, and everything else is read-only afterwards.
@@ -138,6 +144,14 @@ type Driver struct {
 	// controllerRegistered is true when the Controller service is registered.
 	// GetPluginCapabilities is derived from it. T-10 sets it.
 	controllerRegistered bool
+
+	// node is the Node service, nil unless the mode runs it. It is not embedded
+	// in Driver: UnimplementedIdentityServer and UnimplementedNodeServer both
+	// define testEmbeddedByValue, so embedding both would be ambiguous.
+	node *nodeService
+
+	// nodeRegistered is true when the Node service is registered.
+	nodeRegistered bool
 
 	// checks are the Probe readiness checks of the current mode.
 	checks []check
@@ -172,6 +186,16 @@ func New(opts Options) (*Driver, error) {
 		return nil, fmt.Errorf("node id is required in %q mode", mode)
 	}
 
+	// NodeStageVolume looks the servers of a volume up by clusterID, so a node
+	// plugin without a configuration could never stage anything.
+	if mode.runsNode() && opts.Config == nil {
+		return nil, fmt.Errorf("cluster configuration is required in %q mode", mode)
+	}
+
+	if err := validateMountLogDir(opts.MountLogDir); err != nil {
+		return nil, err
+	}
+
 	version := opts.Version
 	if strings.TrimSpace(version) == "" {
 		version = unknownVersion
@@ -189,6 +213,17 @@ func New(opts Options) (*Driver, error) {
 	}
 	d.identityService = identityService{driver: d}
 	d.checks = d.readinessChecks()
+
+	if mode.runsNode() {
+		d.node = &nodeService{
+			driver:  d,
+			mounter: newMounter(opts.MountLogDir),
+			logDir:  opts.MountLogDir,
+			locks:   newInflight(),
+			stat:    os.Stat,
+		}
+		d.nodeRegistered = true
+	}
 
 	klog.V(2).InfoS("glusterfs-csi driver initialised",
 		"driverName", d.driverName, "mode", string(d.mode), "version", d.version)
@@ -264,10 +299,26 @@ func (d *Driver) Serve(ctx context.Context, lis net.Listener) error {
 	return nil
 }
 
+// validateMountLogDir validates Options.MountLogDir. An empty value disables the
+// mount log file and is always accepted; anything else is used in a path, so it
+// has to be absolute and clean instead of being normalized silently.
+func validateMountLogDir(dir string) error {
+	switch {
+	case dir == "":
+		return nil
+	case !filepath.IsAbs(dir):
+		return fmt.Errorf("invalid mount log directory %q: must be an absolute path", dir)
+	case filepath.Clean(dir) != dir:
+		return fmt.Errorf("invalid mount log directory %q: must be a clean path", dir)
+	}
+	return nil
+}
+
 // NodeID returns the raw --nodeid value. It is empty in controller only mode
-// and is reported by NodeGetInfo (T-06).
+// and is reported by NodeGetInfo.
 func (d *Driver) NodeID() string { return d.nodeID }
 
-// Config returns the cluster configuration store. It may be nil in tests that
-// do not need a configuration; the Controller service (T-10) handles that.
+// Config returns the cluster configuration store. It is nil in controller mode
+// unless one was passed; the Node service (T-06) requires it and the Controller
+// service (T-10) handles a nil store.
 func (d *Driver) Config() *config.Store { return d.config }

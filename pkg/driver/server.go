@@ -52,9 +52,15 @@ func (d *Driver) newGRPCServer() (*grpc.Server, error) {
 	if d.controllerRegistered && !d.mode.runsController() {
 		return nil, fmt.Errorf("mode %q cannot register the controller service", d.mode)
 	}
+	if d.nodeRegistered && !d.mode.runsNode() {
+		return nil, fmt.Errorf("mode %q cannot register the node service", d.mode)
+	}
+	if d.nodeRegistered {
+		csi.RegisterNodeServer(srv, d.node)
+	}
 
 	klog.V(2).InfoS("glusterfs-csi gRPC server created", "mode", string(d.mode),
-		"controllerRegistered", d.controllerRegistered)
+		"controllerRegistered", d.controllerRegistered, "nodeRegistered", d.nodeRegistered)
 	return srv, nil
 }
 

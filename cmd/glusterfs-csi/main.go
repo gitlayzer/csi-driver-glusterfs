@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -31,6 +32,8 @@ const (
 	DefaultEndpoint = "unix:///csi/csi.sock"
 	// DefaultConfigPath is the default path of the cluster configuration file.
 	DefaultConfigPath = "/etc/glusterfs-csi/config.json"
+	// DefaultMountLogDir is the default directory of the per-volume mount logs.
+	DefaultMountLogDir = "/var/log/glusterfs/csi"
 )
 
 // usageError wraps an error that the flag package already reported on its own
@@ -43,12 +46,13 @@ func (e *usageError) Unwrap() error { return e.err }
 
 // options holds the values of the command line flags.
 type options struct {
-	endpoint   string
-	nodeID     string
-	mode       string
-	driverName string
-	configPath string
-	showVer    bool
+	endpoint    string
+	nodeID      string
+	mode        string
+	driverName  string
+	configPath  string
+	mountLogDir string
+	showVer     bool
 }
 
 // validateFlags checks the parsed command line flags.
@@ -89,6 +93,16 @@ func validateFlags(opts options) error {
 		return errors.New("--config must not be empty")
 	}
 
+	// An empty value disables the mount log file; anything else ends up in a path.
+	if opts.mountLogDir != "" {
+		if !filepath.IsAbs(opts.mountLogDir) {
+			return fmt.Errorf("invalid --mount-log-dir: %q must be an absolute path", opts.mountLogDir)
+		}
+		if filepath.Clean(opts.mountLogDir) != opts.mountLogDir {
+			return fmt.Errorf("invalid --mount-log-dir: %q must be a clean path", opts.mountLogDir)
+		}
+	}
+
 	return nil
 }
 
@@ -105,6 +119,8 @@ func parseFlags(args []string, output io.Writer) (options, error) {
 	fs.StringVar(&opts.mode, "mode", string(driver.ModeAll), "Run mode: controller, node or all")
 	fs.StringVar(&opts.driverName, "drivername", DriverName, "Name of the CSI driver")
 	fs.StringVar(&opts.configPath, "config", DefaultConfigPath, "Path of the cluster configuration file")
+	fs.StringVar(&opts.mountLogDir, "mount-log-dir", DefaultMountLogDir,
+		"Directory of the per-volume glusterfs mount logs; an empty value disables the log-file mount option")
 	fs.BoolVar(&opts.showVer, "version", false, "Print the version and exit")
 
 	klog.InitFlags(fs)
@@ -175,19 +191,21 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}()
 
 	d, err := driver.New(driver.Options{
-		DriverName: opts.driverName,
-		NodeID:     opts.nodeID,
-		Endpoint:   opts.endpoint,
-		Mode:       mode,
-		Version:    version.Get().Version,
-		Config:     store,
+		DriverName:  opts.driverName,
+		NodeID:      opts.nodeID,
+		Endpoint:    opts.endpoint,
+		Mode:        mode,
+		Version:     version.Get().Version,
+		Config:      store,
+		MountLogDir: opts.mountLogDir,
 	})
 	if err != nil {
 		return err
 	}
 
 	klog.InfoS("glusterfs-csi starting", "mode", opts.mode, "nodeID", opts.nodeID,
-		"driverName", opts.driverName, "endpoint", opts.endpoint, "version", version.Get().Version)
+		"driverName", opts.driverName, "endpoint", opts.endpoint, "mountLogDir", opts.mountLogDir,
+		"version", version.Get().Version)
 
 	return d.Run(ctx)
 }

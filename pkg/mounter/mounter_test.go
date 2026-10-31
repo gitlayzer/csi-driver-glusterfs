@@ -961,3 +961,118 @@ func (l *lyingMounter) IsMountPoint(file string) (bool, error) {
 	}
 	return true, nil
 }
+
+// refsErrMounter is a FakeMounter whose GetMountRefs fails, which the real
+// FakeMounter never does.
+type refsErrMounter struct {
+	*mount.FakeMounter
+	err error
+}
+
+func (r refsErrMounter) GetMountRefs(string) ([]string, error) { return nil, r.err }
+
+func TestOtherBindMounts(t *testing.T) {
+	spec := Spec{Servers: []string{"g1"}, Volume: "vol"}
+
+	tests := []struct {
+		name string
+		// bindTargets is how many targets bind mount the staging path.
+		bindTargets int
+		// exceptIndex is the target passed as except, -1 for one that is not
+		// mounted at all.
+		exceptIndex int
+		// otherVolume mounts a second glusterfs volume that must not count.
+		otherVolume bool
+		wantOthers  int
+	}{
+		{name: "staged, not published", bindTargets: 0, exceptIndex: -1, wantOthers: 0},
+		{name: "published only at except", bindTargets: 1, exceptIndex: 0, wantOthers: 0},
+		{name: "published at another target", bindTargets: 1, exceptIndex: -1, wantOthers: 1},
+		{name: "published at except and another target", bindTargets: 2, exceptIndex: 1, wantOthers: 1},
+		{name: "another volume does not count", bindTargets: 0, exceptIndex: -1, otherVolume: true, wantOthers: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			fake := mount.NewFakeMounter(nil)
+			m := New(fake, testLogDir)
+
+			// The resolved path: FakeMounter turns a bind mount source into the
+			// device of the mount only when it equals the recorded (resolved)
+			// mount point, so an unresolved source would hide the reference on
+			// macOS. The Linux mounter matches by major:minor instead.
+			_, staging := newTestTarget(t)
+			if err := m.MountGlusterfs(ctx, spec, staging); err != nil {
+				t.Fatalf("MountGlusterfs(%q) = %v, want nil", staging, err)
+			}
+			if tc.otherVolume {
+				otherStaging, _ := newTestTarget(t)
+				other := Spec{Servers: []string{"g1"}, Volume: "other"}
+				if err := m.MountGlusterfs(ctx, other, otherStaging); err != nil {
+					t.Fatalf("MountGlusterfs(%q) = %v, want nil", otherStaging, err)
+				}
+			}
+			var targets, resolvedTargets []string
+			for range tc.bindTargets {
+				target, resolved := newTestTarget(t)
+				if err := m.BindMount(ctx, staging, target, false); err != nil {
+					t.Fatalf("BindMount(%q, %q) = %v, want nil", staging, target, err)
+				}
+				targets = append(targets, target)
+				resolvedTargets = append(resolvedTargets, resolved)
+			}
+			except := filepath.Join(t.TempDir(), "unmounted")
+			if tc.exceptIndex >= 0 {
+				// The unresolved path, as the CO passes it: OtherBindMounts has to
+				// match it against the resolved path of the mount table.
+				except = targets[tc.exceptIndex]
+			}
+
+			others, err := m.OtherBindMounts(staging, except)
+			if err != nil {
+				t.Fatalf("OtherBindMounts(%q, %q) = %v, want nil", staging, except, err)
+			}
+			if len(others) != tc.wantOthers {
+				t.Fatalf("OtherBindMounts(%q, %q) = %q, want %d entries", staging, except, others, tc.wantOthers)
+			}
+			for _, o := range others {
+				if tc.exceptIndex >= 0 && o == resolvedTargets[tc.exceptIndex] {
+					t.Errorf("OtherBindMounts returned except %q", o)
+				}
+				if !slicesContains(resolvedTargets, o) {
+					t.Errorf("OtherBindMounts returned %q, which is not a bind target of %q", o, staging)
+				}
+			}
+		})
+	}
+
+	t.Run("invalid paths", func(t *testing.T) {
+		m := New(mount.NewFakeMounter(nil), testLogDir)
+		for _, args := range [][2]string{{"relative", "/abs"}, {"/abs", "/abs/../x"}} {
+			if _, err := m.OtherBindMounts(args[0], args[1]); !errors.Is(err, ErrInvalidSpec) {
+				t.Errorf("OtherBindMounts(%q, %q) = %v, want ErrInvalidSpec", args[0], args[1], err)
+			}
+		}
+	})
+
+	t.Run("mount table error", func(t *testing.T) {
+		cause := errors.New("mountinfo unreadable")
+		m := New(refsErrMounter{FakeMounter: mount.NewFakeMounter(nil), err: cause}, testLogDir)
+		_, err := m.OtherBindMounts("/staging", "/target")
+		if !errors.Is(err, cause) {
+			t.Fatalf("OtherBindMounts() = %v, want an error wrapping %v", err, cause)
+		}
+		if !strings.Contains(err.Error(), "/staging") {
+			t.Errorf("error %q does not mention the source", err)
+		}
+	})
+}
+
+func slicesContains(s []string, v string) bool {
+	for _, e := range s {
+		if e == v {
+			return true
+		}
+	}
+	return false
+}

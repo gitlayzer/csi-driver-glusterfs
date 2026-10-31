@@ -25,6 +25,14 @@ const bufSize = 1024 * 1024
 // test instead of hanging it.
 func identityServer(t *testing.T, d *Driver) csi.IdentityClient {
 	t.Helper()
+	return csi.NewIdentityClient(bufconnConn(t, d))
+}
+
+// bufconnConn starts a real gRPC server for d on a bufconn listener and returns a
+// client connection to it. The server, the listener and the connection are all
+// stopped by t.Cleanup.
+func bufconnConn(t *testing.T, d *Driver) *grpc.ClientConn {
+	t.Helper()
 
 	lis := bufconn.Listen(bufSize)
 	srv, err := d.newGRPCServer()
@@ -68,7 +76,7 @@ func identityServer(t *testing.T, d *Driver) csi.IdentityClient {
 		}
 	})
 
-	return csi.NewIdentityClient(conn)
+	return conn
 }
 
 // TestIdentityGetPluginInfo covers GetPluginInfo over gRPC.
@@ -216,9 +224,8 @@ func TestIdentityProbe(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			opts := baseOptions()
+			opts := nodeOptions(t)
 			opts.Mode = tc.mode
-			opts.NodeID = "node-1"
 
 			d, err := New(opts)
 			if err != nil {

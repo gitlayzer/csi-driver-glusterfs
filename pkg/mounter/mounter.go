@@ -67,6 +67,11 @@ type Mounter interface {
 	// point returns (false, error wrapping ErrCorruptedMount), which
 	// NodeGetVolumeStats (T-07) reports as VOLUME_CONDITION.
 	IsMountPoint(target string) (bool, error)
+	// OtherBindMounts returns the mount points that show the file system
+	// mounted at source, except source itself and except, i.e. the bind mounts
+	// of a staging path other than one target path. NodePublishVolume uses it
+	// to refuse a second target of a single node access mode.
+	OtherBindMounts(source, except string) ([]string, error)
 }
 
 // mounter is the container local implementation of [Mounter]. The FUSE process
@@ -303,6 +308,39 @@ func (m *mounter) IsMountPoint(target string) (bool, error) {
 		// tell a missing path from a real failure.
 		return false, fmt.Errorf("check whether %q is a mount point: %w", target, err)
 	}
+}
+
+// OtherBindMounts returns the mount points of the file system mounted at
+// source other than source and except.
+//
+// mount-utils' GetMountRefs does the matching: on Linux it compares the root
+// and major:minor of /proc/self/mountinfo, so a separate FUSE mount of the same
+// GlusterFS volume (which gets a device number of its own) is not mistaken for
+// a bind mount of source. Its result has symbolic links resolved, so except is
+// compared both as given and resolved, like in findMountEntry.
+func (m *mounter) OtherBindMounts(source, except string) ([]string, error) {
+	if err := validatePath("source", source); err != nil {
+		return nil, err
+	}
+	if err := validatePath("except", except); err != nil {
+		return nil, err
+	}
+	refs, err := m.inner.GetMountRefs(source)
+	if err != nil {
+		return nil, fmt.Errorf("list mount references of %q: %w", source, err)
+	}
+	resolved := except
+	if r, rerr := filepath.EvalSymlinks(except); rerr == nil {
+		resolved = r
+	}
+
+	var others []string
+	for _, ref := range refs {
+		if ref != except && ref != resolved {
+			others = append(others, ref)
+		}
+	}
+	return others, nil
 }
 
 // findMountEntry returns the mount table entry of target, preferring the last

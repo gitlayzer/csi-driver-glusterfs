@@ -19,6 +19,18 @@ func baseOptions() Options {
 	}
 }
 
+// nodeOptions returns a valid option set in node mode, including the cluster
+// configuration that node mode requires and the default mount log directory.
+func nodeOptions(t *testing.T) Options {
+	t.Helper()
+
+	opts := baseOptions()
+	opts.Mode, opts.NodeID = ModeNode, "node-1"
+	opts.Config = testConfigStore(t)
+	opts.MountLogDir = "/var/log/glusterfs/csi"
+	return opts
+}
+
 func TestNew(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -54,6 +66,39 @@ func TestNew(t *testing.T) {
 			mutate: func(o *Options) { o.Version = "   " },
 		},
 
+		{
+			name:    "node mode without a configuration",
+			mutate:  func(o *Options) { o.Mode, o.NodeID, o.Config = ModeNode, "node-1", nil },
+			wantErr: "cluster configuration is required",
+		},
+		{
+			name:    "all mode without a configuration",
+			mutate:  func(o *Options) { o.Mode, o.NodeID, o.Config = ModeAll, "node-1", nil },
+			wantErr: "cluster configuration is required",
+		},
+		{
+			name:   "controller mode without a configuration",
+			mutate: func(o *Options) { o.Config = nil },
+		},
+		{
+			name:    "relative mount log directory",
+			mutate:  func(o *Options) { o.MountLogDir = "var/log" },
+			wantErr: "invalid mount log directory",
+		},
+		{
+			name:    "unclean mount log directory",
+			mutate:  func(o *Options) { o.MountLogDir = "/a/../b" },
+			wantErr: "invalid mount log directory",
+		},
+		{
+			name:    "mount log directory with a trailing slash",
+			mutate:  func(o *Options) { o.MountLogDir = "/var/log/" },
+			wantErr: "invalid mount log directory",
+		},
+		{
+			name:   "empty mount log directory disables the log file",
+			mutate: func(o *Options) { o.MountLogDir = "" },
+		},
 		{
 			name:    "node mode without nodeid",
 			mutate:  func(o *Options) { o.Mode = ModeNode },
@@ -98,7 +143,10 @@ func TestNew(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			// Node and all mode need a configuration, so every case starts with
+			// one; the cases that check the missing-configuration error clear it.
 			opts := baseOptions()
+			opts.Config = testConfigStore(t)
 			tc.mutate(&opts)
 
 			d, err := New(opts)
@@ -128,7 +176,20 @@ func TestNew(t *testing.T) {
 				t.Fatalf("mode = %q, want %q", d.mode, opts.Mode)
 			}
 			if d.controllerRegistered {
-				t.Fatal("controllerRegistered = true in T-04, want false")
+				t.Fatal("controllerRegistered = true, want false")
+			}
+			if want := opts.Mode == ModeNode || opts.Mode == ModeAll; d.nodeRegistered != want {
+				t.Fatalf("nodeRegistered = %t, want %t in %q mode", d.nodeRegistered, want, opts.Mode)
+			}
+			if opts.Mode == ModeNode || opts.Mode == ModeAll {
+				if d.node == nil {
+					t.Fatal("node = nil, want a node service in node and all mode")
+				}
+				if d.node.logDir != opts.MountLogDir {
+					t.Fatalf("node.logDir = %q, want %q", d.node.logDir, opts.MountLogDir)
+				}
+			} else if d.node != nil {
+				t.Fatal("node != nil, want no node service in controller mode")
 			}
 		})
 	}
@@ -147,8 +208,8 @@ func TestNewChecks(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(string(tc.mode), func(t *testing.T) {
-			opts := baseOptions()
-			opts.Mode, opts.NodeID = tc.mode, "node-1"
+			opts := nodeOptions(t)
+			opts.Mode = tc.mode
 
 			d, err := New(opts)
 			if err != nil {
@@ -214,8 +275,7 @@ func TestNewVersionFallback(t *testing.T) {
 // TestNewGRPCServerControllerModeMismatch checks the guard that keeps a future
 // task from advertising a controller service that the mode does not run.
 func TestNewGRPCServerControllerModeMismatch(t *testing.T) {
-	opts := baseOptions()
-	opts.Mode, opts.NodeID = ModeNode, "node-1"
+	opts := nodeOptions(t)
 
 	d, err := New(opts)
 	if err != nil {
@@ -228,6 +288,10 @@ func TestNewGRPCServerControllerModeMismatch(t *testing.T) {
 	}
 
 	d.mode = ModeController
+	// Clearing the flag is what a driver built in controller mode looks like;
+	// the mode alone does not unregister a service.
+	d.nodeRegistered = false
+	d.node = nil
 	srv, err := d.newGRPCServer()
 	if err != nil {
 		t.Fatalf("newGRPCServer() = %v, want nil in controller mode", err)
