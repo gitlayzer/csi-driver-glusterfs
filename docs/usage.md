@@ -14,7 +14,7 @@
 - 所有节点内核支持 FUSE（`/dev/fuse` 存在）。容器内挂载模式下，宿主机无需安装 glusterfs 客户端。
 - K8s 节点到 Gluster 节点的上述端口网络可达。
 - K8s 节点能解析 Gluster 服务器的主机名（DNS 或节点 `/etc/hosts`）：node 插件使用 hostNetwork，容器内的 `/etc/hosts` 来自节点（D-21），FUSE 客户端按 volfile 中的主机名连接 brick。
-- kubelet 根目录为 `/var/lib/kubelet`（k3s、microk8s 等需修改清单中的 hostPath）。
+- kubelet 根目录为 `/var/lib/kubelet`（k3s、microk8s 等：Helm 设置 `kubeletDir`，kustomize 需修改清单中的 hostPath）。
 
 ## 2. 安装
 
@@ -33,13 +33,28 @@ controller Deployment（M2 起）2 副本、由 csi-provisioner 选主，可直�
 静态卷示例见 `deploy/kustomize/examples/static`（修改 PV 的 volumeHandle 后 `kubectl apply -k`）；
 动态卷示例见 `deploy/kustomize/examples/dynamic`（修改 StorageClass 的 clusterID 与 parentVolume 后 `kubectl apply -k`）。
 
-**目标形态：Helm（M2 起）**
+**M2：Helm（T-14 起）**。chart 在 `deploy/helm/glusterfs-csi`，默认值渲染出的对象与 kustomize 的 `overlays/sample` 逐字相同（D-32、D-33），
+资源名固定，一个集群只能安装一份（kustomize 与 Helm 二选一）。chart 不创建命名空间；启用了 Pod Security Admission 的集群需要先建好并打标签：
 ```bash
-helm install glusterfs-csi deploy/helm/glusterfs-csi -n glusterfs-csi --create-namespace \
-  --set clusters[0].id=prod \
-  --set clusters[0].servers='{10.0.0.11,10.0.0.12,10.0.0.13}'
+kubectl create namespace glusterfs-csi
+kubectl label namespace glusterfs-csi pod-security.kubernetes.io/enforce=privileged
+helm install glusterfs-csi deploy/helm/glusterfs-csi -n glusterfs-csi -f my-values.yaml
 ```
-集群配置最终写入 ConfigMap `glusterfs-csi-config`：
+`my-values.yaml` 至少要有 `clusters`（键名与下文的配置文件相同，原样写入 ConfigMap `glusterfs-csi-config`），并建议固定镜像 tag：
+```yaml
+image:
+  tag: sha-<短 sha>          # 默认是 chart 的 appVersion（main）
+clusters:
+  - clusterID: prod
+    servers: [10.0.0.11, 10.0.0.12, 10.0.0.13]
+storageClasses:              # 可选，默认不建
+  - name: glusterfs-subdir
+    parameters: { clusterID: prod, provisioningMode: subdir, parentVolume: csi-parent, onDelete: archive }
+```
+其它可调项（sidecar 镜像、资源、nodeSelector/tolerations/affinity、`kubeletDir`、`logLevel` 等）见 chart 的 `values.yaml`。
+`helm upgrade` 修改 `clusters` 后驱动约 10s 内热加载；node DaemonSet 仍是 `OnDelete`，升级镜像后要逐节点腾空并删除插件 Pod。
+
+集群配置最终写入 ConfigMap `glusterfs-csi-config`（`executorSecretRef` 为 M3 的 volume / 配额 / 快照模式所用）：
 ```json
 [
   {
