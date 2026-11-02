@@ -23,11 +23,15 @@
 ```bash
 cp -r deploy/kustomize/overlays/sample deploy/kustomize/overlays/mycluster   # 编辑其中的 config.json 与 images.newTag
 kubectl apply -k deploy/kustomize/overlays/mycluster
-kubectl -n glusterfs-csi get pods -o wide            # 每个节点一个 glusterfs-csi-node，3/3 Ready
+kubectl -n glusterfs-csi get pods -o wide            # 每个节点一个 glusterfs-csi-node（3/3），两个 glusterfs-csi-controller（3/3）
 kubectl get csinode -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.spec.drivers[*].name}{"\n"}{end}'
+kubectl -n glusterfs-csi get lease                   # 当前持有选主 Lease 的 controller Pod
 ```
 node DaemonSet 使用 `updateStrategy: OnDelete`：升级时先腾空一个节点的业务 Pod，再删除该节点的插件 Pod，逐节点进行。
-静态卷示例见 `deploy/kustomize/examples/static`（修改 PV 的 volumeHandle 后 `kubectl apply -k`）。
+controller Deployment（M2 起）2 副本、由 csi-provisioner 选主，可直接滚动升级；它与 node 插件一样使用 hostNetwork，
+占用宿主机端口 29652、29653，两个副本会被调度到不同节点（D-28）。controller 挂载父卷，同样需要能解析 Gluster 主机名。
+静态卷示例见 `deploy/kustomize/examples/static`（修改 PV 的 volumeHandle 后 `kubectl apply -k`）；
+动态卷示例见 `deploy/kustomize/examples/dynamic`（修改 StorageClass 的 clusterID 与 parentVolume 后 `kubectl apply -k`）。
 
 **目标形态：Helm（M2 起）**
 ```bash
@@ -83,9 +87,9 @@ parameters:
   provisioningMode: subdir
   parentVolume: csi-parent
   # quota: "true"          # M3 起支持，需要 executor；M2 设为 "true" 会被拒绝，不设则容量仅为声明值
-  onDelete: delete         # delete | retain | archive
+  onDelete: archive        # delete | retain | archive；缺省 delete，示例用 archive 防误删（D-29）
 reclaimPolicy: Delete
-allowVolumeExpansion: true   # 扩容在 M3 实现
+allowVolumeExpansion: false  # 扩容在 M3 实现（届时部署 external-resizer 并改为 true）
 mountOptions: [log-level=WARNING]
 ```
 `provisioningMode` 缺省为 `subdir`，`onDelete` 缺省为 `delete`。参数名区分大小写；不认识的参数会让创建失败（`InvalidArgument`），以免拼错的参数被静默忽略（D-22）。

@@ -135,7 +135,7 @@ type Executor interface {
 - 以 volume 名 / volume_id 为键的 in-flight 锁（同 kubernetes-csi 惯例），冲突返回 `Aborted`。
 - CreateVolume：同名且参数一致返回已有卷；同名但容量/参数不兼容返回 `AlreadyExists`。
 - DeleteVolume：卷不存在返回成功。
-- Controller 多副本由 sidecar 做 leader election，驱动本身不需要选主。
+- Controller 多副本由 sidecar 做 leader election，驱动本身不需要选主（D-28：2 副本，Lease 在 `glusterfs-csi` 命名空间）。备用副本收不到 RPC，不会挂载父卷。
 
 ### 5.6 删除策略
 SC 参数 `onDelete: delete | retain | archive`，默认 `delete`。策略在 CreateVolume 时写入卷的元数据文件（D-25），DeleteVolume 从元数据读取：`delete` 删除目录；`retain` 保留目录、只删元数据（同名卷之后不能再创建，需管理员处理）；`archive` 重命名为 `.glusterfs-csi/archive/<pv>-<UTC 时间戳>`（D-26）。有目录而无元数据的卷视为非本驱动创建，DeleteVolume 不动它并返回成功。
