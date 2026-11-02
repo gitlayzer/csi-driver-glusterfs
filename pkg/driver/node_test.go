@@ -46,10 +46,11 @@ type mountCall struct {
 type fakeMounter struct {
 	mu sync.Mutex
 
-	// mountErrs, bindErrs, unmountErrs, cleanupErrs, bindTargetsErrs and
+	// mountErrs, bindErrs, stackErrs, unmountErrs, cleanupErrs, bindTargetsErrs and
 	// detachErrs are the queued errors.
 	mountErrs       []error
 	bindErrs        []error
+	stackErrs       []error
 	unmountErrs     []error
 	cleanupErrs     []error
 	bindTargetsErrs []error
@@ -80,6 +81,7 @@ type fakeMounter struct {
 
 	mountCalls   []mountCall
 	bindCalls    []mountCall
+	stackCalls   []mountCall
 	unmountCalls []string
 	cleanupCalls []string
 	checkCalls   []string
@@ -91,9 +93,10 @@ type fakeMounter struct {
 	bindTargetCalls []string
 	detachCalls     []string
 	// calls is the ordered log of the calls that change or inspect the mount
-	// state, spelled "bindTargets:/s", "detach:/s", "unmount:/s", "mount:/s" and
-	// "bind:/source->/target:ro". The recovery tests assert the exact order with
-	// it, which the per-method call lists cannot express.
+	// state, spelled "bindTargets:/s", "detach:/s", "unmount:/s", "mount:/s",
+	// "bind:/source->/target:ro" and "stack:/source->/target:ro". The recovery
+	// tests assert the exact order with it, which the per-method call lists
+	// cannot express.
 	calls []string
 	// onDetach is called synchronously at the end of a successful Detach, before
 	// the lock is released. Tests use it to observe the state of the world at the
@@ -182,6 +185,23 @@ func (f *fakeMounter) BindMount(_ context.Context, source, target string, readOn
 	f.bindErrs, err = next(f.bindErrs)
 	f.bindCalls = append(f.bindCalls, mountCall{source: source, target: target, readOnly: readOnly})
 	f.record("bind:" + source + "->" + target + ":" + roSuffix(readOnly))
+	if err == nil {
+		f.setState(target, mounter.MountStateMounted)
+	}
+	return err
+}
+
+// StackBindMount records the call and returns the next queued error. A
+// successful stack leaves the target mounted, like a bind mount: the new layer
+// hides whatever was there before.
+func (f *fakeMounter) StackBindMount(_ context.Context, source, target string, readOnly bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	var err error
+	f.stackErrs, err = next(f.stackErrs)
+	f.stackCalls = append(f.stackCalls, mountCall{source: source, target: target, readOnly: readOnly})
+	f.record("stack:" + source + "->" + target + ":" + roSuffix(readOnly))
 	if err == nil {
 		f.setState(target, mounter.MountStateMounted)
 	}
@@ -282,7 +302,8 @@ func (f *fakeMounter) VolumeMountState(target, volume, subdir string) (mounter.M
 	return f.mountState, f.mountStateErr
 }
 
-// mountCount, bindCount, unmountCount and cleanupCount report the call counts.
+// mountCount, bindCount, stackCount, unmountCount and cleanupCount report the
+// call counts.
 func (f *fakeMounter) mountCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -293,6 +314,12 @@ func (f *fakeMounter) bindCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.bindCalls)
+}
+
+func (f *fakeMounter) stackCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.stackCalls)
 }
 
 func (f *fakeMounter) unmountCount() int {
@@ -1140,13 +1167,16 @@ func TestNodeStageVolumeRecord(t *testing.T) {
 					"bindTargets:" + staging,
 					"unmount:" + staging,
 					"mount:" + staging,
-					"detach:" + testTarget1,
-					"bind:" + staging + "->" + testTarget1 + ":ro",
-					"detach:" + testTarget2,
-					"bind:" + staging + "->" + testTarget2 + ":rw",
+					"stack:" + staging + "->" + testTarget1 + ":ro",
+					"stack:" + staging + "->" + testTarget2 + ":rw",
 				}
 				if got := fake.callLog(); !slices.Equal(got, want) {
 					t.Errorf("calls = %q, want %q", got, want)
+				}
+				// The targets are stacked over, never detached: a detach would not
+				// propagate into a HostToContainer container (D-19, T-08b).
+				if got := fake.detachCalls; len(got) != 0 {
+					t.Errorf("Detach calls = %q, want none", got)
 				}
 				if len(rec.Targets) != 0 {
 					t.Errorf("Targets = %+v, want none after the refresh", rec.Targets)
@@ -1154,10 +1184,10 @@ func TestNodeStageVolumeRecord(t *testing.T) {
 			},
 		},
 		{
-			name: "a target that cannot be bound again stays in the record",
+			name: "a target that cannot be stacked again stays in the record",
 			mutate: func(_ *testing.T, _ *csi.NodeStageVolumeRequest, fake *fakeMounter, _ *nodeService) {
 				fake.mountErrs = []error{fmt.Errorf("%w: ENOTCONN", mounter.ErrCorruptedMount)}
-				fake.bindErrs = []error{errors.New("device busy")}
+				fake.stackErrs = []error{errors.New("device busy")}
 				fake.trackState = true
 				fake.mountStateOf = map[string]mounter.MountState{
 					testTarget1: mounter.MountStateCorrupted,
@@ -1198,11 +1228,13 @@ func TestNodeStageVolumeRecord(t *testing.T) {
 				t.Helper()
 				want := []string{
 					"mount:" + staging,
-					"detach:" + testTarget1,
-					"bind:" + staging + "->" + testTarget1 + ":rw",
+					"stack:" + staging + "->" + testTarget1 + ":rw",
 				}
 				if got := fake.callLog(); !slices.Equal(got, want) {
 					t.Errorf("calls = %q, want %q", got, want)
+				}
+				if got := fake.detachCalls; len(got) != 0 {
+					t.Errorf("Detach calls = %q, want none", got)
 				}
 				if len(rec.Targets) != 0 {
 					t.Errorf("Targets = %+v, want none after the refresh", rec.Targets)
@@ -1444,7 +1476,9 @@ func TestNodePublishVolume(t *testing.T) {
 		heldVolume bool
 		wantCode   codes.Code
 		wantBind   int
-		wantCheck  int
+		// wantStack is the number of StackBindMount calls.
+		wantStack int
+		wantCheck int
 		// wantOther is the number of OtherBindMounts calls.
 		wantOther int
 		// check runs after the generic assertions.
@@ -1621,36 +1655,69 @@ func TestNodePublishVolume(t *testing.T) {
 			wantOther: 1,
 		},
 		{
-			name: "corrupted target is recovered once",
+			name: "corrupted target is stacked over",
 			mutate: func(_ *testing.T, _ *csi.NodePublishVolumeRequest, fake *fakeMounter) {
 				fake.isMountPoint = true
 				fake.bindErrs = []error{fmt.Errorf("%w: ENOTCONN", mounter.ErrCorruptedMount)}
 			},
 			wantCode:  codes.OK,
-			wantBind:  2,
+			wantBind:  1,
+			wantStack: 1,
 			wantCheck: 1,
 			wantOther: 1,
-			check: func(t *testing.T, fake *fakeMounter, _, target string) {
+			check: func(t *testing.T, fake *fakeMounter, staging, target string) {
 				t.Helper()
-				if got := fake.unmountCount(); got != 1 {
-					t.Errorf("Unmount calls = %d, want 1", got)
+				// Stacked, not unmounted first: a detach would not propagate into
+				// a HostToContainer container (D-19, T-08b).
+				if got := fake.unmountCount(); got != 0 {
+					t.Errorf("Unmount calls = %d, want 0", got)
 				}
-				if fake.unmountCalls[0] != target {
-					t.Errorf("Unmount target = %q, want %q", fake.unmountCalls[0], target)
+				if got := fake.detachCalls; len(got) != 0 {
+					t.Errorf("Detach calls = %q, want none", got)
+				}
+				call := fake.stackCalls[0]
+				if call.source != staging || call.target != target || call.readOnly {
+					t.Errorf("StackBindMount(%q, %q, %t), want (%q, %q, false)",
+						call.source, call.target, call.readOnly, staging, target)
+				}
+				want := []string{
+					"bind:" + staging + "->" + target + ":rw",
+					"stack:" + staging + "->" + target + ":rw",
+				}
+				if got := fake.callLog(); !slices.Equal(got, want) {
+					t.Errorf("calls = %q, want %q", got, want)
 				}
 			},
 		},
 		{
-			name: "two corrupted binds stop after the second attempt",
-			mutate: func(_ *testing.T, _ *csi.NodePublishVolumeRequest, fake *fakeMounter) {
+			name: "a corrupted target is stacked read only when the mount is",
+			mutate: func(_ *testing.T, req *csi.NodePublishVolumeRequest, fake *fakeMounter) {
 				fake.isMountPoint = true
-				fake.bindErrs = []error{
-					fmt.Errorf("%w: ENOTCONN", mounter.ErrCorruptedMount),
-					fmt.Errorf("%w: ENOTCONN", mounter.ErrCorruptedMount),
+				req.Readonly = true
+				fake.bindErrs = []error{fmt.Errorf("%w: ENOTCONN", mounter.ErrCorruptedMount)}
+			},
+			wantCode:  codes.OK,
+			wantBind:  1,
+			wantStack: 1,
+			wantCheck: 1,
+			wantOther: 1,
+			check: func(t *testing.T, fake *fakeMounter, _, _ string) {
+				t.Helper()
+				if !fake.stackCalls[0].readOnly {
+					t.Error("readOnly = false, want true for a readonly request")
 				}
 			},
+		},
+		{
+			name: "stacking on a corrupted target fails",
+			mutate: func(_ *testing.T, _ *csi.NodePublishVolumeRequest, fake *fakeMounter) {
+				fake.isMountPoint = true
+				fake.bindErrs = []error{fmt.Errorf("%w: ENOTCONN", mounter.ErrCorruptedMount)}
+				fake.stackErrs = []error{errors.New("device busy")}
+			},
 			wantCode:  codes.Internal,
-			wantBind:  2,
+			wantBind:  1,
+			wantStack: 1,
 			wantCheck: 1,
 			wantOther: 1,
 		},
@@ -1826,6 +1893,9 @@ func TestNodePublishVolume(t *testing.T) {
 
 			if got := fake.bindCount(); got != tc.wantBind {
 				t.Fatalf("BindMount calls = %d, want %d", got, tc.wantBind)
+			}
+			if got := fake.stackCount(); got != tc.wantStack {
+				t.Fatalf("StackBindMount calls = %d, want %d", got, tc.wantStack)
 			}
 			if got := len(fake.checkCalls); got != tc.wantCheck {
 				t.Fatalf("IsMountPoint calls = %d, want %d", got, tc.wantCheck)
@@ -2535,7 +2605,7 @@ func TestNodeCorruptedMountPointReachesMounter(t *testing.T) {
 				})
 				return err
 			},
-			calls: (*fakeMounter).bindCount,
+			calls: func(fake *fakeMounter) int { return fake.bindCount() + fake.stackCount() },
 		},
 	}
 
@@ -2557,8 +2627,11 @@ func TestNodeCorruptedMountPointReachesMounter(t *testing.T) {
 			if got := tc.calls(fake); got != 2 {
 				t.Errorf("mount attempts = %d, want 2 (corrupted, then recovered)", got)
 			}
-			if got := fake.unmountCount(); got != 1 {
-				t.Errorf("Unmount calls = %d, want 1", got)
+			// The staging mount is detached and mounted again, the bind target
+			// of a Pod is stacked over (T-08b); both repairs are one attempt
+			// each, so exactly one of the two kinds of repair ran.
+			if got := fake.unmountCount() + fake.stackCount(); got != 1 {
+				t.Errorf("repairs = %d, want 1 (a detach of the staging mount or a stack on the target)", got)
 			}
 			if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 				t.Errorf("os.Stat(%q) = %v, want the directory not to be created", path, err)

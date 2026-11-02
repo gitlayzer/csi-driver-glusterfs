@@ -40,8 +40,10 @@ const (
 	// volume and which survives a restart of the plugin container (D-20).
 	DefaultStateDir = "/var/lib/kubelet/plugins/glusterfs.csi.io/staged"
 	// DefaultRecoveryInterval is how often the mount recovery runs after the pass
-	// at startup.
-	DefaultRecoveryInterval = 60 * time.Second
+	// at startup. It is short because a pass that raced the exit of the FUSE
+	// process judged a dead mount healthy and the next one is what repairs it
+	// (D-20, T-08b).
+	DefaultRecoveryInterval = 10 * time.Second
 )
 
 // usageError wraps an error that the flag package already reported on its own
@@ -150,7 +152,7 @@ func parseFlags(args []string, output io.Writer) (options, error) {
 	fs.StringVar(&opts.stateDir, "state-dir", DefaultStateDir,
 		"Directory of the staging records the mount recovery works from; an empty value disables the records and the recovery")
 	fs.DurationVar(&opts.recoveryInterval, "recovery-interval", DefaultRecoveryInterval,
-		"How often the mount recovery scans the staging records; 0 scans at startup only")
+		"How often the mount recovery scans the staging records; 0 scans at startup only, the default is 10s")
 	fs.BoolVar(&opts.showVer, "version", false, "Print the version and exit")
 
 	klog.InitFlags(fs)

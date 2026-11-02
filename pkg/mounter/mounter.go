@@ -27,7 +27,8 @@ var (
 	// ErrCorruptedMount means the target is a mount point whose file system
 	// stopped responding, typically because the FUSE process exited (ENOTCONN).
 	// It is reported instead of a plain error so that the caller can decide to
-	// unmount and mount again; the startup recovery of T-08 does exactly that.
+	// repair the mount: a bind target is stacked over, a staging mount is
+	// detached and mounted again (the startup recovery of T-08, T-08b).
 	ErrCorruptedMount = errors.New("target is a corrupted mount point")
 )
 
@@ -105,6 +106,14 @@ type Mounter interface {
 	// BindMount bind-mounts source at target, read only if readOnly is set. It
 	// is used by NodePublishVolume, once per Pod.
 	BindMount(ctx context.Context, source, target string, readOnly bool) error
+	// StackBindMount bind-mounts source on top of whatever is mounted at target,
+	// read only if readOnly is set. Unlike BindMount it does not look at the
+	// current mount and does not refuse a corrupted one: the new mount hides the
+	// old one, and, unlike an unmount followed by a bind mount, it propagates
+	// into containers that see target through a HostToContainer (rslave) volume
+	// mount. Every call adds a layer, so callers use it only on a corrupted
+	// target.
+	StackBindMount(ctx context.Context, source, target string, readOnly bool) error
 	// Unmount unmounts target, including a corrupted mount point, and keeps the
 	// directory. It is used by NodeUnstageVolume.
 	Unmount(ctx context.Context, target string) error
@@ -158,6 +167,11 @@ type mounter struct {
 	// platform implementation; it is a field so that a test can record the calls
 	// instead of unmounting something on the test machine.
 	detach func(target string) error
+	// lstat is the stat [Mounter.StackBindMount] does on the target. Production
+	// uses [os.Lstat]; it is a field so that a test can report a corrupted mount
+	// point, which a FakeMounter cannot produce because it never touches the file
+	// system.
+	lstat func(target string) (fs.FileInfo, error)
 }
 
 // The compiler has to reject any drift between the interface and the
@@ -173,6 +187,7 @@ func New(m mount.Interface, logDir string) Mounter {
 		logDir:        logDir,
 		mountInfoPath: procMountInfoPath,
 		detach:        detachMount,
+		lstat:         os.Lstat,
 	}
 }
 
@@ -279,17 +294,71 @@ func (m *mounter) BindMount(ctx context.Context, source, target string, readOnly
 		return m.checkExistingBindMount(target, readOnly)
 	}
 
-	options := []string{"bind"}
-	if readOnly {
-		// mount-utils turns "bind,ro" into bind + remount,ro on Linux, because
-		// a bind mount does not honour the read-only flag on its own.
-		options = append(options, "ro")
-	}
+	options := bindOptions(readOnly)
 	if err := m.inner.Mount(source, target, "", options); err != nil {
 		return fmt.Errorf("bind mount %q at %q: %w", source, target, err)
 	}
 	klog.V(2).InfoS("bind mounted volume", "source", source, "target", target, "options", options)
 	return nil
+}
+
+// StackBindMount bind-mounts source on top of whatever is mounted at target,
+// read only if readOnly is set.
+//
+// It is the repair of a corrupted target, and it is deliberately the opposite of
+// unmounting first: a container that sees target through a HostToContainer
+// (rslave) volume mount holds a replica of the mount that existed when the
+// container started. Unmounting the dead mount and bind mounting again replaces
+// the mount the replica was made from, so the new one never reaches the
+// container, which keeps seeing ENOTCONN. A mount stacked on top of the dead one
+// is a new child mount and propagates into every such container within a second
+// (D-19, T-08b).
+//
+// Mounting over a corrupted mount point works because the kernel only needs the
+// path, not a successful stat of it. A target that is not mounted at all is fine
+// as well, so the call is idempotent for a caller that has to repair a target it
+// has not inspected. Every call adds a layer; [Mounter.Cleanup] removes them all.
+func (m *mounter) StackBindMount(ctx context.Context, source, target string, readOnly bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validatePath("source", source); err != nil {
+		return err
+	}
+	if err := validatePath("target", target); err != nil {
+		return err
+	}
+
+	// The target must exist, but a stat that fails because the FUSE process is
+	// gone is exactly the case this method is for, so it is not an error.
+	switch _, statErr := m.lstat(target); {
+	case statErr == nil:
+	case errors.Is(statErr, fs.ErrNotExist):
+		return fmt.Errorf("target %q does not exist: %w", target, statErr)
+	case isCorrupted(statErr):
+	default:
+		return fmt.Errorf("stat target %q: %w", target, statErr)
+	}
+
+	options := bindOptions(readOnly)
+	if err := m.inner.Mount(source, target, "", options); err != nil {
+		return fmt.Errorf("stack bind mount %q at %q: %w", source, target, err)
+	}
+	klog.V(2).InfoS("stacked a bind mount", "source", source, "target", target, "options", options)
+	return nil
+}
+
+// bindOptions returns the mount options of a bind mount: "bind" and, for a read
+// only mount, "ro".
+//
+// mount-utils turns "bind,ro" into bind + remount,ro on Linux, because a bind
+// mount does not honour the read-only flag on its own.
+func bindOptions(readOnly bool) []string {
+	options := []string{"bind"}
+	if readOnly {
+		options = append(options, "ro")
+	}
+	return options
 }
 
 // checkExistingBindMount decides whether the mount that is already at target
@@ -327,6 +396,18 @@ func (m *mounter) Cleanup(ctx context.Context, target string) error {
 	return m.unmount(ctx, target, true)
 }
 
+// maxUnmountLayers is the number of mount layers [mounter.unmount] removes at
+// most before it gives up.
+//
+// A target can carry more than one mount: the recovery repairs a corrupted bind
+// mount by stacking a fresh one on top of it instead of unmounting it (D-19,
+// T-08b), so every restart of the node plugin that finds a corrupted target adds
+// a layer. Unpublishing removes all of them, which is what the loop is for. The
+// limit exists so that a target that is still a mount point after an unmount,
+// i.e. an unmount that makes no progress, ends in an error instead of an endless
+// loop.
+const maxUnmountLayers = 64
+
 // unmount is the shared implementation of [Mounter.Unmount] and
 // [Mounter.Cleanup]. mount-utils has CleanupMountPoint, but it unconditionally
 // removes the directory, and the staging directory of an unstaged volume is
@@ -339,27 +420,12 @@ func (m *mounter) unmount(ctx context.Context, target string, removeDir bool) er
 		return err
 	}
 
-	mounted, err := m.IsMountPoint(target)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		// The path is gone, and with it the mount: nothing left to do.
-		klog.V(4).InfoS("target does not exist, nothing to unmount", "target", target)
-	case err != nil && errors.Is(err, ErrCorruptedMount):
-		// The recovery path: a broken FUSE mount point can only be removed by
-		// unmounting it, and that works even when it cannot be stat'ed.
-		if uerr := m.inner.Unmount(target); uerr != nil {
-			return fmt.Errorf("unmount corrupted mount %q: %w", target, uerr)
-		}
-		klog.V(2).InfoS("unmounted corrupted mount", "target", target)
-	case err != nil:
+	layers, err := m.unmountLayers(ctx, target)
+	if err != nil {
 		return err
-	case mounted:
-		if uerr := m.inner.Unmount(target); uerr != nil {
-			return fmt.Errorf("unmount %q: %w", target, uerr)
-		}
-		klog.V(2).InfoS("unmounted volume", "target", target)
-	default:
-		klog.V(4).InfoS("target is not a mount point, skipping unmount", "target", target)
+	}
+	if layers > 1 {
+		klog.V(2).InfoS("unmounted stacked mounts", "target", target, "layers", layers)
 	}
 
 	if !removeDir {
@@ -372,6 +438,55 @@ func (m *mounter) unmount(ctx context.Context, target string, removeDir bool) er
 		return fmt.Errorf("remove target directory %q: %w", target, rerr)
 	}
 	return nil
+}
+
+// unmountLayers unmounts target until it is not a mount point any more and
+// reports how many layers it removed.
+//
+// Unmounting one layer at a time is what a stacked target needs: the kernel
+// removes the top-most mount only, and the layer underneath may be the corrupted
+// one the recovery stacked over, which then still has to be removed.
+func (m *mounter) unmountLayers(ctx context.Context, target string) (int, error) {
+	layers := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return layers, err
+		}
+
+		mounted, err := m.IsMountPoint(target)
+		corrupted := errors.Is(err, ErrCorruptedMount)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			// The path is gone, and with it the mount: nothing left to do.
+			klog.V(4).InfoS("target does not exist, nothing to unmount", "target", target)
+			return layers, nil
+		case corrupted:
+			// The recovery path: a broken FUSE mount point can only be removed
+			// by unmounting it, and that works even when it cannot be stat'ed.
+		case err != nil:
+			return layers, err
+		case !mounted:
+			klog.V(4).InfoS("target is not a mount point, skipping unmount", "target", target)
+			return layers, nil
+		}
+
+		if layers == maxUnmountLayers {
+			return layers, fmt.Errorf("target %q is still a mount point after %d unmounts",
+				target, maxUnmountLayers)
+		}
+		if uerr := m.inner.Unmount(target); uerr != nil {
+			if corrupted {
+				return layers, fmt.Errorf("unmount corrupted mount %q: %w", target, uerr)
+			}
+			return layers, fmt.Errorf("unmount %q: %w", target, uerr)
+		}
+		if corrupted {
+			klog.V(2).InfoS("unmounted corrupted mount", "target", target)
+		} else {
+			klog.V(2).InfoS("unmounted volume", "target", target)
+		}
+		layers++
+	}
 }
 
 // IsMountPoint reports whether target is a mount point. A corrupted mount point

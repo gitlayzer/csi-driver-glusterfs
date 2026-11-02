@@ -55,7 +55,7 @@ spec:
             - --nodeid=$(NODE_ID)
             - --config=/etc/glusterfs-csi/config.json
             - --state-dir=/var/lib/kubelet/plugins/glusterfs.csi.io/staged
-            - --recovery-interval=60s
+            - --recovery-interval=10s
             - --mount-log-dir=/var/log/glusterfs/csi
             - --v=2
           env:

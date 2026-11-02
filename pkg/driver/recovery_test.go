@@ -152,10 +152,10 @@ func TestRecoverVolume(t *testing.T) {
 				"bindTargets:" + testStaging,
 				"detach:" + testStaging,
 				"mount:" + testStaging,
-				"detach:" + testTarget1,
-				"bind:" + testStaging + "->" + testTarget1 + ":rw",
-				"detach:" + testTarget2,
-				"bind:" + testStaging + "->" + testTarget2 + ":ro",
+				// The targets are stacked over, never detached: only a stacked
+				// mount propagates into a HostToContainer container (T-08b).
+				"stack:" + testStaging + "->" + testTarget1 + ":rw",
+				"stack:" + testStaging + "->" + testTarget2 + ":ro",
 			},
 			wantRecord: true,
 			check: func(t *testing.T, s *recoverySite) {
@@ -177,8 +177,8 @@ func TestRecoverVolume(t *testing.T) {
 				if !reflect.DeepEqual(spec.Options, []string{"acl", "log-level=INFO"}) {
 					t.Errorf("Options = %v, want the recorded mount flags", spec.Options)
 				}
-				if got := s.fake.bindCalls[1].readOnly; !got {
-					t.Error("the second bind target was bound read write, want read only")
+				if got := s.fake.stackCalls[1].readOnly; !got {
+					t.Error("the second bind target was stacked read write, want read only")
 				}
 			},
 		},
@@ -200,10 +200,8 @@ func TestRecoverVolume(t *testing.T) {
 				"bindTargets:" + testStaging,
 				"detach:" + testStaging,
 				"mount:" + testStaging,
-				"detach:" + testTarget1,
-				"bind:" + testStaging + "->" + testTarget1 + ":rw",
-				"detach:" + testTarget2,
-				"bind:" + testStaging + "->" + testTarget2 + ":ro",
+				"stack:" + testStaging + "->" + testTarget1 + ":rw",
+				"stack:" + testStaging + "->" + testTarget2 + ":ro",
 			},
 			wantRecord: true,
 		},
@@ -236,8 +234,7 @@ func TestRecoverVolume(t *testing.T) {
 				"bindTargets:" + testStaging,
 				"detach:" + testStaging,
 				"mount:" + testStaging,
-				"detach:" + testTarget1,
-				"bind:" + testStaging + "->" + testTarget1 + ":rw",
+				"stack:" + testStaging + "->" + testTarget1 + ":rw",
 			},
 			wantRecord: true,
 			check: func(t *testing.T, s *recoverySite) {
@@ -268,7 +265,8 @@ func TestRecoverVolume(t *testing.T) {
 			check: func(t *testing.T, s *recoverySite) {
 				t.Helper()
 				for _, call := range s.fake.callLog() {
-					if strings.HasPrefix(call, "bind:") || strings.HasPrefix(call, "detach:"+testTarget1) {
+					if strings.HasPrefix(call, "bind:") || strings.HasPrefix(call, "stack:") ||
+						call == "detach:"+testTarget1 {
 						t.Fatalf("a target was touched although the remount failed: %v", s.fake.callLog())
 					}
 				}
@@ -299,10 +297,8 @@ func TestRecoverVolume(t *testing.T) {
 			wantOutcome: recoveryRecovered,
 			wantCalls: []string{
 				"mount:" + testStaging,
-				"detach:" + testTarget1,
-				"bind:" + testStaging + "->" + testTarget1 + ":rw",
-				"detach:" + testTarget2,
-				"bind:" + testStaging + "->" + testTarget2 + ":ro",
+				"stack:" + testStaging + "->" + testTarget1 + ":rw",
+				"stack:" + testStaging + "->" + testTarget2 + ":ro",
 			},
 			wantRecord: true,
 		},
@@ -368,30 +364,35 @@ func TestRecoverVolume(t *testing.T) {
 				"bindTargets:" + testStaging,
 				"detach:" + testStaging,
 				"mount:" + testStaging,
-				"detach:" + testTarget2,
-				"bind:" + testStaging + "->" + testTarget2 + ":ro",
+				"stack:" + testStaging + "->" + testTarget2 + ":ro",
 			},
 			// The target of the held lock stays pending, the other one is done.
 			wantTargets: []recordTarget{{Path: testTarget1}},
 			wantRecord:  true,
 		},
 		{
-			name: "a target cannot be bound again",
+			name: "a target cannot be stacked again",
 			rec:  stageRecordOf(testStaging, false, nil, targets...),
 			state: map[string]mounter.MountState{
 				testTarget1: mounter.MountStateCorrupted,
 				testTarget2: mounter.MountStateCorrupted,
 			},
-			prep:        func(_ *testing.T, s *recoverySite) { s.fake.bindErrs = []error{errors.New("bind failed")} },
+			prep:        func(_ *testing.T, s *recoverySite) { s.fake.stackErrs = []error{errors.New("stack failed")} },
 			wantOutcome: recoveryPartial,
 			wantCalls: []string{
-				"detach:" + testTarget1,
-				"bind:" + testStaging + "->" + testTarget1 + ":rw",
-				"detach:" + testTarget2,
-				"bind:" + testStaging + "->" + testTarget2 + ":ro",
+				"stack:" + testStaging + "->" + testTarget1 + ":rw",
+				"stack:" + testStaging + "->" + testTarget2 + ":ro",
 			},
 			wantTargets: []recordTarget{{Path: testTarget1}},
 			wantRecord:  true,
+			check: func(t *testing.T, s *recoverySite) {
+				t.Helper()
+				// A failed repair must not have detached anything either: the
+				// target is retried by the next pass.
+				if got := s.fake.detachCalls; len(got) != 0 {
+					t.Fatalf("Detach calls = %q, want none", got)
+				}
+			},
 		},
 		{
 			name:  "mounted with one corrupted and one mounted target",
@@ -400,8 +401,7 @@ func TestRecoverVolume(t *testing.T) {
 			// The mounted target is dropped without being touched: it is fine.
 			wantOutcome: recoveryRecovered,
 			wantCalls: []string{
-				"detach:" + testTarget1,
-				"bind:" + testStaging + "->" + testTarget1 + ":rw",
+				"stack:" + testStaging + "->" + testTarget1 + ":rw",
 			},
 			wantRecord: true,
 		},
@@ -463,8 +463,7 @@ func TestRecoverVolume(t *testing.T) {
 			// The unreadable target stays pending, the other one is refreshed.
 			wantOutcome: recoveryPartial,
 			wantCalls: []string{
-				"detach:" + testTarget2,
-				"bind:" + testStaging + "->" + testTarget2 + ":ro",
+				"stack:" + testStaging + "->" + testTarget2 + ":ro",
 			},
 			wantTargets: []recordTarget{{Path: testTarget1}},
 			wantRecord:  true,
@@ -482,14 +481,14 @@ func TestRecoverVolume(t *testing.T) {
 			wantRecord:  false,
 		},
 		{
-			name:  "a corrupted bind mount cannot be detached",
+			name:  "a corrupted bind mount cannot be stacked over",
 			rec:   stageRecordOf(testStaging, false, nil, targets...),
 			state: map[string]mounter.MountState{testTarget1: mounter.MountStateCorrupted},
-			prep:  func(_ *testing.T, s *recoverySite) { s.fake.detachErrs = []error{errors.New("busy")} },
-			// A detach failure keeps the target pending, the other one (which is
+			prep:  func(_ *testing.T, s *recoverySite) { s.fake.stackErrs = []error{errors.New("busy")} },
+			// A failed stack keeps the target pending, the other one (which is
 			// mounted) is dropped.
 			wantOutcome: recoveryPartial,
-			wantCalls:   []string{"detach:" + testTarget1},
+			wantCalls:   []string{"stack:" + testStaging + "->" + testTarget1 + ":rw"},
 			wantTargets: []recordTarget{{Path: testTarget1}},
 			wantRecord:  true,
 		},
@@ -724,10 +723,8 @@ func TestRecoverVolumeInterruptedRecovery(t *testing.T) {
 	}
 	want := []string{
 		"mount:" + testStaging,
-		"detach:" + testTarget1,
-		"bind:" + testStaging + "->" + testTarget1 + ":rw",
-		"detach:" + testTarget2,
-		"bind:" + testStaging + "->" + testTarget2 + ":ro",
+		"stack:" + testStaging + "->" + testTarget1 + ":rw",
+		"stack:" + testStaging + "->" + testTarget2 + ":ro",
 	}
 	if got := site.fake.callLog(); !reflect.DeepEqual(got, want) {
 		t.Fatalf("second pass call log = %v, want %v", got, want)

@@ -215,8 +215,13 @@ func (s *nodeService) recoverAll(ctx context.Context) recoverySummary {
 //     entry and with it every trace of its bind targets;
 //  2. the corrupted staging mount is detached lazily and mounted again with the
 //     servers of the live configuration;
-//  3. every pending bind target is detached and bound again with its recorded
-//     read-only flag.
+//  3. every pending bind target is repaired by stacking a fresh bind mount on top
+//     of the dead one, with its recorded read-only flag.
+//
+// The staging mount is detached because no container ever mounts it directly, so
+// nothing can miss the replacement. A bind target must not be detached: the
+// copy of it that a container holds through HostToContainer propagation is lost
+// with the unmount, and the container would keep seeing ENOTCONN (D-19, T-08b).
 //
 // Every step that fails returns an error and leaves the record in a state the next
 // pass can continue from.
@@ -385,7 +390,7 @@ func (s *nodeService) remountVolume(ctx context.Context, rec stageRecord, id vol
 	return nil
 }
 
-// refreshTargets detaches and binds again every pending target of rec.
+// refreshTargets stacks a fresh bind mount on every pending target of rec.
 //
 // It returns the targets that are still pending and how many were refreshed.
 // A target is dropped from the list when it is mounted, not mounted at all (the
@@ -420,8 +425,15 @@ func (s *nodeService) refreshTargets(ctx context.Context, rec stageRecord, id vo
 
 // refreshTarget repairs one bind target of a staged volume.
 //
-// It reports whether the target was bound again. A target that is mounted, not
+// It reports whether the target was repaired. A target that is mounted, not
 // mounted or mounted from something else needs no action.
+//
+// A corrupted target is repaired by stacking a fresh bind mount on top of the
+// dead one, never by detaching it first (D-19, T-08b): the mount a container sees
+// through a HostToContainer (rslave) volumeMount is a replica of the mount that
+// existed when the container started, and replacing the mount it was copied from
+// does not propagate into the container. A mount stacked on top is a new child
+// mount and does propagate, so the container recovers without a restart.
 func (s *nodeService) refreshTarget(ctx context.Context, rec stageRecord, id volumeid.ID, target recordTarget) (bool, error) {
 	state, err := s.mounter.VolumeMountState(target.Path, id.Volume, id.Subdir)
 	if err != nil {
@@ -431,18 +443,13 @@ func (s *nodeService) refreshTarget(ctx context.Context, rec stageRecord, id vol
 		return false, nil
 	}
 
-	// The dead mount is detached first: bind mounting over it would leave the
-	// broken mount in place and the Pod would keep seeing ENOTCONN.
-	if derr := s.mounter.Detach(target.Path); derr != nil {
-		return false, fmt.Errorf("detach the corrupted bind mount %q: %w", target.Path, derr)
-	}
-	// Bound again from the staging mount, with the read-only flag of the original
+	// Stacked from the staging mount, with the read-only flag of the original
 	// bind mount: a read-only Pod must not suddenly get a writable volume, and a
 	// writable one must not lose write access.
-	if berr := s.mounter.BindMount(ctx, rec.StagingTargetPath, target.Path, target.ReadOnly); berr != nil {
-		return false, fmt.Errorf("bind mount %q again: %w", target.Path, berr)
+	if serr := s.mounter.StackBindMount(ctx, rec.StagingTargetPath, target.Path, target.ReadOnly); serr != nil {
+		return false, fmt.Errorf("stack a bind mount on the corrupted target %q: %w", target.Path, serr)
 	}
-	klog.InfoS("bound a target again", "volumeID", rec.VolumeID,
+	klog.InfoS("stacked a fresh bind mount on a target", "volumeID", rec.VolumeID,
 		"stagingTargetPath", rec.StagingTargetPath, "targetPath", target.Path, "readOnly", target.ReadOnly)
 	return true, nil
 }

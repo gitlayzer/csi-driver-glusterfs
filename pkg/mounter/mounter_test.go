@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 
@@ -552,6 +553,217 @@ func TestBindMount(t *testing.T) {
 	})
 }
 
+func TestStackBindMount(t *testing.T) {
+	t.Run("healthy target", func(t *testing.T) {
+		tests := []struct {
+			name        string
+			readOnly    bool
+			wantOptions []string
+		}{
+			{name: "read write", readOnly: false, wantOptions: []string{"bind"}},
+			{name: "read only", readOnly: true, wantOptions: []string{"bind", "ro"}},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				source, _ := newTestTarget(t)
+				target, resolved := newTestTarget(t)
+				fake := mount.NewFakeMounter(nil)
+				m := New(fake, testLogDir)
+
+				if err := m.StackBindMount(context.Background(), source, target, tc.readOnly); err != nil {
+					t.Fatalf("StackBindMount(%q, %q, %t) = %v, want nil", source, target, tc.readOnly, err)
+				}
+				log := fake.GetLog()
+				if len(log) != 1 || log[0].Action != mount.FakeActionMount {
+					t.Fatalf("mount log = %+v, want exactly one mount", log)
+				}
+				if log[0].Source != source || log[0].FSType != "" {
+					t.Errorf("mount log source/fstype = %q/%q, want %q/\"\"", log[0].Source, log[0].FSType, source)
+				}
+				points := fake.MountPoints
+				if len(points) != 1 || points[0].Path != resolved {
+					t.Fatalf("MountPoints = %+v, want one entry for %q", points, resolved)
+				}
+				assertOptions(t, points[0].Opts, tc.wantOptions)
+			})
+		}
+	})
+
+	t.Run("a mounted target gets one more layer", func(t *testing.T) {
+		source, _ := newTestTarget(t)
+		target, resolved := newTestTarget(t)
+		fake := mount.NewFakeMounter(nil)
+		m := New(fake, testLogDir)
+
+		if err := m.StackBindMount(context.Background(), source, target, false); err != nil {
+			t.Fatalf("first StackBindMount(%q) = %v, want nil", target, err)
+		}
+		// Unlike BindMount it does not look at the existing mount, so a second
+		// call stacks a second layer instead of being a no-op: that is what the
+		// recovery needs over a dead mount.
+		if err := m.StackBindMount(context.Background(), source, target, false); err != nil {
+			t.Fatalf("second StackBindMount(%q) = %v, want nil", target, err)
+		}
+		count := 0
+		for _, mp := range fake.MountPoints {
+			if mp.Path == resolved {
+				count++
+			}
+		}
+		if count != 2 {
+			t.Fatalf("entries for %q in the mount table = %d, want 2: %+v", resolved, count, fake.MountPoints)
+		}
+		if got := actionCount(fake, mount.FakeActionMount); got != 2 {
+			t.Errorf("mount count = %d, want 2", got)
+		}
+	})
+
+	t.Run("missing target", func(t *testing.T) {
+		source, _ := newTestTarget(t)
+		target := filepath.Join(t.TempDir(), "does-not-exist")
+		fake := mount.NewFakeMounter(nil)
+		m := New(fake, testLogDir)
+
+		err := m.StackBindMount(context.Background(), source, target, false)
+		if !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("StackBindMount(%q) = %v, want an error wrapping fs.ErrNotExist", target, err)
+		}
+		if got := len(fake.GetLog()); got != 0 {
+			t.Errorf("mount log = %+v, want no action", fake.GetLog())
+		}
+	})
+
+	t.Run("invalid paths", func(t *testing.T) {
+		tests := []struct {
+			name   string
+			source string
+			target string
+		}{
+			{name: "empty source", source: "", target: "/target"},
+			{name: "relative source", source: "source", target: "/target"},
+			{name: "unclean source", source: "/a/../b", target: "/target"},
+			{name: "empty target", source: "/source", target: ""},
+			{name: "relative target", source: "/source", target: "target"},
+			{name: "unclean target", source: "/source", target: "/a/../b"},
+		}
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				fake := mount.NewFakeMounter(nil)
+				m := New(fake, testLogDir)
+
+				err := m.StackBindMount(context.Background(), tc.source, tc.target, false)
+				if !errors.Is(err, ErrInvalidSpec) {
+					t.Fatalf("StackBindMount(%q, %q) = %v, want ErrInvalidSpec", tc.source, tc.target, err)
+				}
+				if got := len(fake.GetLog()); got != 0 {
+					t.Errorf("mount log = %+v, want no action", fake.GetLog())
+				}
+			})
+		}
+	})
+
+	t.Run("cancelled context", func(t *testing.T) {
+		source, _ := newTestTarget(t)
+		target, _ := newTestTarget(t)
+		fake := mount.NewFakeMounter(nil)
+		m := New(fake, testLogDir)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := m.StackBindMount(ctx, source, target, false)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("StackBindMount with a cancelled context = %v, want context.Canceled", err)
+		}
+		if got := len(fake.GetLog()); got != 0 {
+			t.Errorf("mount log = %+v, want no action", fake.GetLog())
+		}
+	})
+
+	t.Run("mount failure is wrapped", func(t *testing.T) {
+		source, _ := newTestTarget(t)
+		target, _ := newTestTarget(t)
+		injected := errors.New("injected mount failure")
+		fake := &failingMountMounter{FakeMounter: mount.NewFakeMounter(nil), err: injected}
+		m := New(fake, testLogDir)
+
+		err := m.StackBindMount(context.Background(), source, target, false)
+		if !errors.Is(err, injected) {
+			t.Fatalf("StackBindMount(%q) = %v, want it to wrap %v", target, err, injected)
+		}
+		if !strings.Contains(err.Error(), target) {
+			t.Errorf("error %q does not mention the target %q", err, target)
+		}
+	})
+
+	// The stat of the target is injected: a FakeMounter cannot produce a
+	// corrupted mount point, because it never touches the file system.
+	t.Run("stat of the target", func(t *testing.T) {
+		tests := []struct {
+			name string
+			err  error
+			// wantMount is true when the stack has to go ahead. A corrupted mount
+			// point is exactly what the call is for, so its stat error must not
+			// stop it; EACCES is in the corrupted list of mount-utils, which makes
+			// a target that cannot be stat'ed for permission reasons a stack as
+			// well (the kernel rejects the mount if the path is unusable). Every
+			// other error means the target is in an unexpected state.
+			wantMount bool
+		}{
+			{name: "no error", err: nil, wantMount: true},
+			{name: "ENOTCONN", err: pathError(syscall.ENOTCONN), wantMount: true},
+			{name: "ESTALE", err: pathError(syscall.ESTALE), wantMount: true},
+			{name: "EIO", err: pathError(syscall.EIO), wantMount: true},
+			{name: "EACCES", err: pathError(syscall.EACCES), wantMount: true},
+			{name: "does not exist", err: pathError(fs.ErrNotExist), wantMount: false},
+			{name: "not a directory", err: pathError(syscall.ENOTDIR), wantMount: false},
+		}
+
+		for _, tc := range tests {
+			t.Run(tc.name, func(t *testing.T) {
+				source, _ := newTestTarget(t)
+				target, _ := newTestTarget(t)
+				fake := mount.NewFakeMounter(nil)
+				m := newTestMounter(t, fake)
+				m.lstat = func(string) (fs.FileInfo, error) { return nil, tc.err }
+
+				err := m.StackBindMount(context.Background(), source, target, false)
+				mounts := actionCount(fake, mount.FakeActionMount)
+				if tc.wantMount {
+					if err != nil {
+						t.Fatalf("StackBindMount(%q) with stat error %v = %v, want nil", target, tc.err, err)
+					}
+					if mounts != 1 {
+						t.Fatalf("mount count = %d, want 1", mounts)
+					}
+					return
+				}
+				if err == nil {
+					t.Fatalf("StackBindMount(%q) with stat error %v = nil, want an error", target, tc.err)
+				}
+				if mounts != 0 {
+					t.Errorf("mount count = %d, want 0", mounts)
+				}
+			})
+		}
+	})
+}
+
+// newTestMounter returns the concrete mounter behind m so that a test can replace
+// one of its injectable fields.
+func newTestMounter(t *testing.T, inner mount.Interface) *mounter {
+	t.Helper()
+	m, ok := New(inner, testLogDir).(*mounter)
+	if !ok {
+		t.Fatalf("New() returned %T, want *mounter", m)
+	}
+	return m
+}
+
+// pathError builds the *os.PathError an os.Lstat call returns for a target.
+func pathError(err error) error {
+	return &os.PathError{Op: "lstat", Path: "/target", Err: err}
+}
+
 func TestUnmountAndCleanup(t *testing.T) {
 	spec := Spec{Servers: []string{"g1"}, Volume: "vol"}
 
@@ -773,6 +985,276 @@ func TestUnmountAndCleanup(t *testing.T) {
 		}
 		if got := actionCount(fake, mount.FakeActionUnmount); got != 0 {
 			t.Errorf("unmount count = %d, want 0", got)
+		}
+	})
+}
+
+// layeredMounter is a FakeMounter whose Unmount removes only the top-most mount
+// of a path, the way the kernel does.
+//
+// FakeMounter.Unmount removes every entry of the path at once, which would hide
+// whether the mounter under test removes all stacked layers or only one. It also
+// cannot make a layer report ENOTCONN, so the shape a leftover recovery leaves
+// behind (a healthy mount over a dead one) could not be built at all.
+type layeredMounter struct {
+	*mount.FakeMounter
+
+	mu sync.Mutex
+	// unmounts counts the Unmount calls.
+	unmounts int
+	// deadAt is the number of remaining layers at which the path reports a
+	// corrupted mount; 0 disables it.
+	deadAt int
+	// failAt is the Unmount call (1-based) that fails with err, 0 for none.
+	failAt int
+	err    error
+	// stall makes Unmount report success without removing a layer, which is an
+	// unmount that makes no progress.
+	stall bool
+	// onUnmount runs at the start of every Unmount call, before it decides what
+	// to do. It is how a test cancels the context in the middle of the loop.
+	onUnmount func(call int)
+}
+
+// targetLayers returns how many layers the mount table has for target.
+func (l *layeredMounter) targetLayers(target string) int {
+	points, err := l.List()
+	if err != nil {
+		return 0
+	}
+	resolved := resolvedPath(target)
+	n := 0
+	for _, mp := range points {
+		if mp.Path == target || mp.Path == resolved {
+			n++
+		}
+	}
+	return n
+}
+
+// IsMountPoint reports a corrupted mount when the top-most remaining layer is the
+// dead one.
+func (l *layeredMounter) IsMountPoint(target string) (bool, error) {
+	l.mu.Lock()
+	deadAt := l.deadAt
+	l.mu.Unlock()
+
+	if deadAt > 0 && l.targetLayers(target) == deadAt {
+		return false, &os.PathError{Op: "stat", Path: target, Err: syscall.ENOTCONN}
+	}
+	return l.FakeMounter.IsMountPoint(target)
+}
+
+// Unmount removes the last mount table entry of target.
+func (l *layeredMounter) Unmount(target string) error {
+	l.mu.Lock()
+	l.unmounts++
+	call := l.unmounts
+	failAt, injected, stall, hook := l.failAt, l.err, l.stall, l.onUnmount
+	l.mu.Unlock()
+
+	if hook != nil {
+		hook(call)
+	}
+	if failAt == call {
+		return injected
+	}
+	if stall {
+		return nil
+	}
+
+	points, err := l.List()
+	if err != nil {
+		return err
+	}
+	resolved := resolvedPath(target)
+	last := -1
+	for i, mp := range points {
+		if mp.Path == target || mp.Path == resolved {
+			last = i
+		}
+	}
+	if last < 0 {
+		return nil
+	}
+	l.MountPoints = append(append([]mount.MountPoint{}, points[:last]...), points[last+1:]...)
+	return nil
+}
+
+// resolvedPath returns the symbolic link resolved path, which is what
+// FakeMounter records, or path itself when it cannot be resolved.
+func resolvedPath(path string) string {
+	if resolved, err := filepath.EvalSymlinks(path); err == nil {
+		return resolved
+	}
+	return path
+}
+
+// stackLayers bind mounts source over target layers times.
+func stackLayers(t *testing.T, m Mounter, source, target string, layers int) {
+	t.Helper()
+	for i := range layers {
+		if err := m.StackBindMount(context.Background(), source, target, false); err != nil {
+			t.Fatalf("layer %d: StackBindMount(%q, %q) = %v, want nil", i+1, source, target, err)
+		}
+	}
+}
+
+func TestUnmountLayers(t *testing.T) {
+	tests := []struct {
+		name string
+		// layers is the number of mounts stacked on the target.
+		layers int
+		// deadAt makes the top-most layer at that count the corrupted one.
+		deadAt int
+		// failAt and stall are handed to the layered mounter.
+		failAt int
+		stall  bool
+		// cancelOn cancels the context inside that Unmount call.
+		cancelOn int
+		// cleanup runs Cleanup instead of Unmount.
+		cleanup bool
+		// wantUnmounts is the exact number of Unmount calls.
+		wantUnmounts int
+		// wantLayers is how many mount layers are left on the target afterwards.
+		wantLayers int
+		wantErr    bool
+		// wantErrIs is an error the returned error must wrap.
+		wantErrIs error
+		wantDir   bool
+	}{
+		{
+			name:         "three healthy layers are all unmounted and the directory goes",
+			layers:       3,
+			cleanup:      true,
+			wantUnmounts: 3,
+		},
+		{
+			name:         "a healthy layer over a dead one is unmounted as well",
+			layers:       2,
+			deadAt:       1,
+			cleanup:      true,
+			wantUnmounts: 2,
+		},
+		{
+			name:         "Unmount keeps the directory",
+			layers:       2,
+			deadAt:       1,
+			wantUnmounts: 2,
+			wantDir:      true,
+		},
+		{
+			name:         "a single layer",
+			layers:       1,
+			cleanup:      true,
+			wantUnmounts: 1,
+		},
+		{
+			name:         "an unmount that removes nothing ends in an error",
+			layers:       1,
+			stall:        true,
+			cleanup:      true,
+			wantUnmounts: maxUnmountLayers,
+			wantLayers:   1,
+			wantErr:      true,
+			wantDir:      true,
+		},
+		{
+			name:         "a failing unmount stops the loop",
+			layers:       3,
+			failAt:       2,
+			cleanup:      true,
+			wantUnmounts: 2,
+			wantLayers:   2,
+			wantErr:      true,
+			wantDir:      true,
+		},
+		{
+			name:   "a cancelled context stops the loop",
+			layers: 3,
+			// The hook runs at the start of the call, so the second unmount still
+			// removes its layer and the loop stops in front of the third.
+			cancelOn:     2,
+			cleanup:      true,
+			wantUnmounts: 2,
+			wantLayers:   1,
+			wantErr:      true,
+			wantErrIs:    context.Canceled,
+			wantDir:      true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			source, _ := newTestTarget(t)
+			target, _ := newTestTarget(t)
+
+			layered := &layeredMounter{
+				FakeMounter: mount.NewFakeMounter(nil),
+				deadAt:      tc.deadAt,
+				failAt:      tc.failAt,
+				err:         errors.New("injected unmount failure"),
+				stall:       tc.stall,
+			}
+			m := New(layered, testLogDir)
+			stackLayers(t, m, source, target, tc.layers)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancelOn > 0 {
+				layered.onUnmount = func(call int) {
+					if call == tc.cancelOn {
+						cancel()
+					}
+				}
+			}
+
+			var err error
+			if tc.cleanup {
+				err = m.Cleanup(ctx, target)
+			} else {
+				err = m.Unmount(ctx, target)
+			}
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("%s() = nil, want an error", tc.name)
+				}
+				if tc.wantErrIs != nil && !errors.Is(err, tc.wantErrIs) {
+					t.Fatalf("%s() = %v, want it to wrap %v", tc.name, err, tc.wantErrIs)
+				}
+			} else if err != nil {
+				t.Fatalf("%s() = %v, want nil", tc.name, err)
+			}
+
+			if got := layered.unmounts; got != tc.wantUnmounts {
+				t.Fatalf("Unmount calls = %d, want %d", got, tc.wantUnmounts)
+			}
+			if got := layered.targetLayers(target); got != tc.wantLayers {
+				t.Fatalf("remaining mount layers = %d, want %d", got, tc.wantLayers)
+			}
+			if got := pathExists(t, target); got != tc.wantDir {
+				t.Fatalf("target directory exists = %t, want %t", got, tc.wantDir)
+			}
+		})
+	}
+
+	t.Run("a stalled unmount never reports the directory as removed", func(t *testing.T) {
+		source, _ := newTestTarget(t)
+		target, _ := newTestTarget(t)
+		layered := &layeredMounter{FakeMounter: mount.NewFakeMounter(nil), stall: true}
+		m := New(layered, testLogDir)
+		stackLayers(t, m, source, target, 1)
+
+		err := m.Cleanup(context.Background(), target)
+		if err == nil {
+			t.Fatal("Cleanup() = nil, want an error for an unmount that makes no progress")
+		}
+		if !strings.Contains(err.Error(), "still a mount point") {
+			t.Fatalf("error %q does not name the reason", err)
+		}
+		if !pathExists(t, target) {
+			t.Fatal("Cleanup() removed the directory although the mount is still there")
 		}
 	})
 }

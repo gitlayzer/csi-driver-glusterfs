@@ -526,18 +526,21 @@ func (s *nodeService) checkSingleTarget(staging, target, volumeID string) error 
 // bindMount performs the bind mount and recovers once from a corrupted target
 // mount point. It is the same recovery as in NodeStageVolume, for the case where
 // the bind mount of a Pod outlived the FUSE process it was made from.
+//
+// The recovery stacks a fresh bind mount on top of the dead one instead of
+// unmounting it first: unmounting would replace the mount that a container sees
+// through a HostToContainer (rslave) volumeMount without reaching the container,
+// while a stacked mount propagates into it (D-19, T-08b). Cleanup removes the
+// stacked layers when the target is unpublished.
 func (s *nodeService) bindMount(ctx context.Context, staging, target string, readOnly bool) error {
 	err := s.mounter.BindMount(ctx, staging, target, readOnly)
 	if !errors.Is(err, mounter.ErrCorruptedMount) {
 		return mountErrorToStatus("publish volume", err)
 	}
 
-	klog.InfoS("target mount is corrupted, unmounting and bind mounting again",
+	klog.InfoS("target mount is corrupted, stacking a fresh bind mount",
 		"targetPath", target, "stagingTargetPath", staging)
-	if uerr := s.mounter.Unmount(ctx, target); uerr != nil {
-		return mountErrorToStatus("publish volume", uerr)
-	}
-	return mountErrorToStatus("publish volume", s.mounter.BindMount(ctx, staging, target, readOnly))
+	return mountErrorToStatus("publish volume", s.mounter.StackBindMount(ctx, staging, target, readOnly))
 }
 
 // NodeUnpublishVolume unmounts the target path and deletes it.

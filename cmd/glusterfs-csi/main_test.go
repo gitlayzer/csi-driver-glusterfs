@@ -571,13 +571,13 @@ func TestRunInvalidFlags(t *testing.T) {
 
 // TestDefaultRecoveryFlags checks the documented defaults of the two recovery
 // flags (D-20): the staging record directory below the kubelet plugin directory
-// and a 60s interval.
+// and a 10s interval (T-08b shortened it from 60s).
 func TestDefaultRecoveryFlags(t *testing.T) {
 	if DefaultStateDir != "/var/lib/kubelet/plugins/glusterfs.csi.io/staged" {
 		t.Fatalf("DefaultStateDir = %q, want the kubelet plugin directory", DefaultStateDir)
 	}
-	if DefaultRecoveryInterval != 60*time.Second {
-		t.Fatalf("DefaultRecoveryInterval = %s, want 60s", DefaultRecoveryInterval)
+	if DefaultRecoveryInterval != 10*time.Second {
+		t.Fatalf("DefaultRecoveryInterval = %s, want 10s", DefaultRecoveryInterval)
 	}
 
 	opts, err := parseFlags(nil, io.Discard)
