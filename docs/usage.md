@@ -52,7 +52,29 @@ storageClasses:              # 可选，默认不建
     parameters: { clusterID: prod, provisioningMode: subdir, parentVolume: csi-parent, onDelete: archive }
 ```
 其它可调项（sidecar 镜像、资源、nodeSelector/tolerations/affinity、`kubeletDir`、`logLevel` 等）见 chart 的 `values.yaml`。
-`helm upgrade` 修改 `clusters` 后驱动约 10s 内热加载；node DaemonSet 仍是 `OnDelete`，升级镜像后要逐节点腾空并删除插件 Pod。
+`helm upgrade` 修改 `clusters` 后无需重启：kubelet 按周期同步把新文件更新进 Pod（通常一两分钟内），驱动每 10s 检查一次文件；node DaemonSet 仍是 `OnDelete`，升级镜像后要逐节点腾空并删除插件 Pod。
+
+**从 kustomize 迁到 Helm（原地接管，已挂载的卷不受影响）**：先给 kustomize 建出的对象加上 Helm 的归属注解与标签，再用
+`helm upgrade --install` 接管；`my-values.yaml` 的 `clusters` 应与原 `config.json` 一致。
+```bash
+NS=glusterfs-csi; REL=glusterfs-csi
+for o in csidriver/glusterfs.csi.io clusterrole/glusterfs-csi-provisioner clusterrolebinding/glusterfs-csi-provisioner; do
+  kubectl annotate --overwrite "$o" meta.helm.sh/release-name=$REL meta.helm.sh/release-namespace=$NS
+  kubectl label --overwrite "$o" app.kubernetes.io/managed-by=Helm
+done
+for o in sa/glusterfs-csi-node sa/glusterfs-csi-controller role/glusterfs-csi-provisioner-cfg \
+  rolebinding/glusterfs-csi-provisioner-cfg cm/glusterfs-csi-config ds/glusterfs-csi-node deploy/glusterfs-csi-controller; do
+  kubectl -n $NS annotate --overwrite "$o" meta.helm.sh/release-name=$REL meta.helm.sh/release-namespace=$NS
+  kubectl -n $NS label --overwrite "$o" app.kubernetes.io/managed-by=Helm
+done
+helm upgrade --install $REL deploy/helm/glusterfs-csi -n $NS -f my-values.yaml --force-conflicts
+```
+- 只在 Helm 4.3.1 上验证过。Helm 4.0.0 接管已有对象会报 `metadata.managedFields must be nil`（helm/helm#31510），先升级 Helm。
+- `--force-conflicts` 是 Helm 4 的参数：`kubectl apply` 写入的字段归 kubectl-client-side-apply 所有，Helm 4 的服务端 apply 不加它会报冲突。
+- `my-values.yaml` 的 `storageClasses` 若与已有 StorageClass 同名，也要同样加注解与标签；StorageClass 的 `parameters` 不可修改，必须与现有对象一致。
+- controller 会滚动升级；node DaemonSet 是 `OnDelete`，插件 Pod 不会重启，之后按上文逐节点替换。
+- 接管失败（release 状态为 failed）时修正问题后重跑 `helm upgrade --install`，**不要** `helm uninstall`：那会删掉被接管的对象，包括正在服务的插件。
+- `helm uninstall` 不删除命名空间（chart 不管理它）和 csi-provisioner 运行时创建的 Lease `glusterfs-csi-io`。
 
 集群配置最终写入 ConfigMap `glusterfs-csi-config`（`executorSecretRef` 为 M3 的 volume / 配额 / 快照模式所用）：
 ```json

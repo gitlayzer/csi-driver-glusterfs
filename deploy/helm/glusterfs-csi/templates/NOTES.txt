@@ -22,5 +22,6 @@ node. Drain the node's workloads and delete the plugin pod node by node instead:
 
   kubectl -n {{ .Release.Namespace }} delete pod -l app.kubernetes.io/name=glusterfs-csi,app.kubernetes.io/component=node --field-selector spec.nodeName=<node>
 
-Changes to "clusters" are hot-reloaded by the driver from the ConfigMap within
-about 10s, no restart is needed.
+Changes to "clusters" are hot-reloaded from the ConfigMap, no restart is needed.
+The kubelet refreshes the mounted file on its periodic sync, usually within a
+minute or two, and the driver picks it up within 10s after that.

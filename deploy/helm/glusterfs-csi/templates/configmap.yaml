@@ -3,9 +3,10 @@
 #
 # The entries of .Values.clusters are serialised verbatim (D-32): field names
 # and extra keys are kept as the installer wrote them (only the key order becomes
-# alphabetical), because it is the driver that parses and validates the file. The kubelet updates the mounted file
-# in place when this ConfigMap changes, which the driver hot-reloads within about
-# 10s; there is deliberately no checksum annotation on the pods.
+# alphabetical), because it is the driver that parses and validates the file.
+# The kubelet updates the mounted file in place when this ConfigMap changes
+# (on its periodic sync, usually within a minute or two) and the driver polls it
+# every 10s; there is deliberately no checksum annotation on the pods.
 #
 # The ConfigMap carries no labels at all: the kustomize sample overlay generates
 # it with configMapGenerator, which adds none either. Adding the Helm labels here
