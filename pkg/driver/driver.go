@@ -128,6 +128,11 @@ type Options struct {
 	// StateDir is the directory of the staging records the mount recovery works
 	// from. Empty disables the records and with them the recovery (D-20).
 	StateDir string
+	// ControllerMountDir is the directory the controller mounts the parent volumes
+	// below, one mount point per cluster and parent volume at
+	// <dir>/<clusterID>/<volume> (D-24). It is required in controller and all mode
+	// and ignored in node mode, which never mounts a parent volume.
+	ControllerMountDir string
 	// RecoveryInterval is how often the recovery pass is repeated after the one at
 	// startup. 0 means "only at startup"; a negative value is an error.
 	RecoveryInterval time.Duration
@@ -136,6 +141,10 @@ type Options struct {
 // Driver is the CSI plugin. It implements the Identity service; the Controller
 // service is registered through the controller field and the Node service
 // through the node field, each only in the modes that run it.
+//
+// The controller service mounts the parent volumes of the subdir volumes it
+// provisions and keeps the mounts until the process stops (D-24), so a Driver in
+// controller or all mode owns the mounts those volumes need.
 //
 // A Driver is safe for concurrent use: the registration flags are only written
 // before the gRPC server starts, and everything else is read-only afterwards.
@@ -221,6 +230,14 @@ func New(opts Options) (*Driver, error) {
 	if err := validateStateDir(opts.StateDir); err != nil {
 		return nil, err
 	}
+	// The controller writes and deletes below its mount points, so a relative or
+	// unclean path would address a different directory than the one the operator
+	// configured. Node mode never uses the value and accepts it empty.
+	if mode.runsController() || opts.ControllerMountDir != "" {
+		if err := validateControllerMountDir(opts.ControllerMountDir); err != nil {
+			return nil, err
+		}
+	}
 	if opts.RecoveryInterval < 0 {
 		return nil, fmt.Errorf("invalid recovery interval %s: must not be negative", opts.RecoveryInterval)
 	}
@@ -245,7 +262,12 @@ func New(opts Options) (*Driver, error) {
 	d.checks = d.readinessChecks()
 
 	if mode.runsController() {
-		d.controller = &controllerService{driver: d, locks: newInflight()}
+		d.controller = &controllerService{
+			driver:  d,
+			locks:   newInflight(),
+			parents: newParentMounts(newMounter(opts.MountLogDir), opts.ControllerMountDir),
+			now:     time.Now,
+		}
 		d.controllerRegistered = true
 	}
 
@@ -266,7 +288,8 @@ func New(opts Options) (*Driver, error) {
 
 	klog.V(2).InfoS("glusterfs-csi driver initialised",
 		"driverName", d.driverName, "mode", string(d.mode), "version", d.version,
-		"stateDir", opts.StateDir, "recoveryInterval", opts.RecoveryInterval.String())
+		"stateDir", opts.StateDir, "recoveryInterval", opts.RecoveryInterval.String(),
+		"controllerMountDir", opts.ControllerMountDir)
 
 	return d, nil
 }
@@ -327,6 +350,13 @@ func (d *Driver) Serve(ctx context.Context, lis net.Listener) error {
 	stopRecovery := d.startRecovery(ctx)
 	defer stopRecovery()
 
+	// The parent volume mounts of the controller are closed after the gRPC server
+	// stopped, on both return paths: closing a root while an RPC still uses it would
+	// fail that RPC with os.ErrClosed for no reason. The deferred call is the one
+	// registered last, so it runs first; the recovery pass and the unmount do not
+	// depend on each other.
+	defer d.closeParentMounts()
+
 	select {
 	case err := <-serveErr:
 		if err != nil && !errors.Is(err, grpc.ErrServerStopped) {
@@ -344,6 +374,25 @@ func (d *Driver) Serve(ctx context.Context, lis net.Listener) error {
 	}
 	klog.InfoS("glusterfs-csi stopped")
 	return nil
+}
+
+// parentMountCloseTimeout bounds how long closing the parent volume mounts may
+// take after the gRPC server stopped. An unmount of a dead FUSE mount can block for
+// a long time, and a plugin that has stopped serving must still exit.
+const parentMountCloseTimeout = 30 * time.Second
+
+// closeParentMounts closes the parent volume mounts of the controller service.
+//
+// It is a no-op in node mode, where there is no controller service. The context is
+// fresh instead of the one Serve was given, because that one is already cancelled at
+// this point and the unmount would refuse to run.
+func (d *Driver) closeParentMounts() {
+	if d.controller == nil || d.controller.parents == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), parentMountCloseTimeout)
+	defer cancel()
+	d.controller.parents.close(ctx)
 }
 
 // startRecovery starts the mount recovery of the node service in the background
@@ -397,13 +446,30 @@ func validateMountLogDir(dir string) error {
 // a directory the driver creates and writes into, so it has to be absolute and
 // clean instead of being normalized silently.
 func validateStateDir(dir string) error {
+	return validateAbsoluteDir("state directory", dir, true)
+}
+
+// validateControllerMountDir validates Options.ControllerMountDir, the directory
+// of the parent volume mount points of the controller (D-24). Unlike a state
+// directory it is required: it is empty only in node mode, which New checks
+// before calling this.
+func validateControllerMountDir(dir string) error {
+	return validateAbsoluteDir("controller mount directory", dir, false)
+}
+
+// validateAbsoluteDir reports whether dir is a usable absolute, clean directory
+// path. An empty value is accepted when optional is set.
+func validateAbsoluteDir(what, dir string, optional bool) error {
 	switch {
 	case dir == "":
-		return nil
+		if optional {
+			return nil
+		}
+		return fmt.Errorf("the %s is required", what)
 	case !filepath.IsAbs(dir):
-		return fmt.Errorf("invalid state directory %q: must be an absolute path", dir)
+		return fmt.Errorf("invalid %s %q: must be an absolute path", what, dir)
 	case filepath.Clean(dir) != dir:
-		return fmt.Errorf("invalid state directory %q: must be a clean path", dir)
+		return fmt.Errorf("invalid %s %q: must be a clean path", what, dir)
 	}
 	return nil
 }

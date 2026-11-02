@@ -39,6 +39,10 @@ const (
 	// in the kubelet plugin directory, which the DaemonSet already mounts as a
 	// volume and which survives a restart of the plugin container (D-20).
 	DefaultStateDir = "/var/lib/kubelet/plugins/glusterfs.csi.io/staged"
+	// DefaultControllerMountDir is the default directory of the parent volume
+	// mount points of the controller plugin (D-24). The Deployment has to mount a
+	// writable volume there.
+	DefaultControllerMountDir = "/var/lib/glusterfs-csi/controller"
 	// DefaultRecoveryInterval is how often the mount recovery runs after the pass
 	// at startup. It is short because a pass that raced the exit of the FUSE
 	// process judged a dead mount healthy and the next one is what repairs it
@@ -56,15 +60,16 @@ func (e *usageError) Unwrap() error { return e.err }
 
 // options holds the values of the command line flags.
 type options struct {
-	endpoint         string
-	nodeID           string
-	mode             string
-	driverName       string
-	configPath       string
-	mountLogDir      string
-	stateDir         string
-	recoveryInterval time.Duration
-	showVer          bool
+	endpoint           string
+	nodeID             string
+	mode               string
+	driverName         string
+	configPath         string
+	mountLogDir        string
+	stateDir           string
+	controllerMountDir string
+	recoveryInterval   time.Duration
+	showVer            bool
 }
 
 // validateFlags checks the parsed command line flags.
@@ -125,6 +130,18 @@ func validateFlags(opts options) error {
 			return fmt.Errorf("invalid --state-dir: %q must be a clean path", opts.stateDir)
 		}
 	}
+	// The controller mounts the parent volumes below this directory (D-24). An empty
+	// value is rejected by driver.New in controller and all mode; the flag handling
+	// only checks the shape of a value that is set, so that the message names the
+	// flag rather than the option.
+	if opts.controllerMountDir != "" {
+		if !filepath.IsAbs(opts.controllerMountDir) {
+			return fmt.Errorf("invalid --controller-mount-dir: %q must be an absolute path", opts.controllerMountDir)
+		}
+		if filepath.Clean(opts.controllerMountDir) != opts.controllerMountDir {
+			return fmt.Errorf("invalid --controller-mount-dir: %q must be a clean path", opts.controllerMountDir)
+		}
+	}
 	// 0 is allowed and means "only at startup"; a negative interval would make
 	// time.NewTicker panic.
 	if opts.recoveryInterval < 0 {
@@ -151,6 +168,8 @@ func parseFlags(args []string, output io.Writer) (options, error) {
 		"Directory of the per-volume glusterfs mount logs; an empty value disables the log-file mount option")
 	fs.StringVar(&opts.stateDir, "state-dir", DefaultStateDir,
 		"Directory of the staging records the mount recovery works from; an empty value disables the records and the recovery")
+	fs.StringVar(&opts.controllerMountDir, "controller-mount-dir", DefaultControllerMountDir,
+		"Directory of the parent volume mount points of the controller; required in controller and all mode")
 	fs.DurationVar(&opts.recoveryInterval, "recovery-interval", DefaultRecoveryInterval,
 		"How often the mount recovery scans the staging records; 0 scans at startup only, the default is 10s")
 	fs.BoolVar(&opts.showVer, "version", false, "Print the version and exit")
@@ -223,15 +242,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	}()
 
 	d, err := driver.New(driver.Options{
-		DriverName:       opts.driverName,
-		NodeID:           opts.nodeID,
-		Endpoint:         opts.endpoint,
-		Mode:             mode,
-		Version:          version.Get().Version,
-		Config:           store,
-		MountLogDir:      opts.mountLogDir,
-		StateDir:         opts.stateDir,
-		RecoveryInterval: opts.recoveryInterval,
+		DriverName:         opts.driverName,
+		NodeID:             opts.nodeID,
+		Endpoint:           opts.endpoint,
+		Mode:               mode,
+		Version:            version.Get().Version,
+		Config:             store,
+		MountLogDir:        opts.mountLogDir,
+		StateDir:           opts.stateDir,
+		ControllerMountDir: opts.controllerMountDir,
+		RecoveryInterval:   opts.recoveryInterval,
 	})
 	if err != nil {
 		return err
@@ -240,7 +260,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	klog.InfoS("glusterfs-csi starting", "mode", opts.mode, "nodeID", opts.nodeID,
 		"driverName", opts.driverName, "endpoint", opts.endpoint, "mountLogDir", opts.mountLogDir,
 		"stateDir", opts.stateDir, "recoveryInterval", opts.recoveryInterval.String(),
-		"version", version.Get().Version)
+		"controllerMountDir", opts.controllerMountDir, "version", version.Get().Version)
 
 	return d.Run(ctx)
 }

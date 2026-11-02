@@ -136,6 +136,7 @@ func TestIdentityGetPluginCapabilities(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := nodeOptions(t)
 			opts.Mode = tc.mode
+			opts.ControllerMountDir = t.TempDir()
 
 			d, err := New(opts)
 			if err != nil {
@@ -235,6 +236,7 @@ func TestIdentityProbe(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := nodeOptions(t)
 			opts.Mode = tc.mode
+			opts.ControllerMountDir = t.TempDir()
 
 			d, err := New(opts)
 			if err != nil {

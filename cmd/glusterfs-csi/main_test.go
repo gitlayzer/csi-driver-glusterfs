@@ -20,14 +20,15 @@ const validConfig = `[{"clusterID":"prod","servers":["gluster-1","10.0.0.13"]}]`
 
 func validOptions() options {
 	return options{
-		endpoint:         DefaultEndpoint,
-		nodeID:           "node-1",
-		mode:             string(driver.ModeAll),
-		driverName:       DriverName,
-		configPath:       DefaultConfigPath,
-		mountLogDir:      DefaultMountLogDir,
-		stateDir:         DefaultStateDir,
-		recoveryInterval: DefaultRecoveryInterval,
+		endpoint:           DefaultEndpoint,
+		nodeID:             "node-1",
+		mode:               string(driver.ModeAll),
+		driverName:         DriverName,
+		configPath:         DefaultConfigPath,
+		mountLogDir:        DefaultMountLogDir,
+		stateDir:           DefaultStateDir,
+		controllerMountDir: DefaultControllerMountDir,
+		recoveryInterval:   DefaultRecoveryInterval,
 	}
 }
 
@@ -245,13 +246,14 @@ func TestParseFlags(t *testing.T) {
 			name: "defaults",
 			args: nil,
 			want: options{
-				endpoint:         DefaultEndpoint,
-				mode:             string(driver.ModeAll),
-				driverName:       DriverName,
-				configPath:       DefaultConfigPath,
-				mountLogDir:      DefaultMountLogDir,
-				stateDir:         DefaultStateDir,
-				recoveryInterval: DefaultRecoveryInterval,
+				endpoint:           DefaultEndpoint,
+				mode:               string(driver.ModeAll),
+				driverName:         DriverName,
+				configPath:         DefaultConfigPath,
+				mountLogDir:        DefaultMountLogDir,
+				stateDir:           DefaultStateDir,
+				controllerMountDir: DefaultControllerMountDir,
+				recoveryInterval:   DefaultRecoveryInterval,
 			},
 		},
 		{
@@ -264,28 +266,31 @@ func TestParseFlags(t *testing.T) {
 				"--config=/tmp/config.json",
 				"--mount-log-dir=/tmp/logs",
 				"--state-dir=/tmp/staged",
+				"--controller-mount-dir=/tmp/controller",
 				"--recovery-interval=90s",
 			},
 			want: options{
-				endpoint:         "tcp://127.0.0.1:10000",
-				nodeID:           "node-1",
-				mode:             string(driver.ModeNode),
-				driverName:       "example.csi.io",
-				configPath:       "/tmp/config.json",
-				mountLogDir:      "/tmp/logs",
-				stateDir:         "/tmp/staged",
-				recoveryInterval: 90 * time.Second,
+				endpoint:           "tcp://127.0.0.1:10000",
+				nodeID:             "node-1",
+				mode:               string(driver.ModeNode),
+				driverName:         "example.csi.io",
+				configPath:         "/tmp/config.json",
+				mountLogDir:        "/tmp/logs",
+				stateDir:           "/tmp/staged",
+				controllerMountDir: "/tmp/controller",
+				recoveryInterval:   90 * time.Second,
 			},
 		},
 		{
 			name: "an empty state dir and a zero interval",
 			args: []string{"--state-dir=", "--recovery-interval=0"},
 			want: options{
-				endpoint:    DefaultEndpoint,
-				mode:        string(driver.ModeAll),
-				driverName:  DriverName,
-				configPath:  DefaultConfigPath,
-				mountLogDir: DefaultMountLogDir,
+				endpoint:           DefaultEndpoint,
+				mode:               string(driver.ModeAll),
+				driverName:         DriverName,
+				configPath:         DefaultConfigPath,
+				mountLogDir:        DefaultMountLogDir,
+				controllerMountDir: DefaultControllerMountDir,
 			},
 		},
 		{
@@ -297,14 +302,15 @@ func TestParseFlags(t *testing.T) {
 			name: "version flag",
 			args: []string{"--version"},
 			want: options{
-				endpoint:         DefaultEndpoint,
-				mode:             string(driver.ModeAll),
-				driverName:       DriverName,
-				configPath:       DefaultConfigPath,
-				mountLogDir:      DefaultMountLogDir,
-				stateDir:         DefaultStateDir,
-				recoveryInterval: DefaultRecoveryInterval,
-				showVer:          true,
+				endpoint:           DefaultEndpoint,
+				mode:               string(driver.ModeAll),
+				driverName:         DriverName,
+				configPath:         DefaultConfigPath,
+				mountLogDir:        DefaultMountLogDir,
+				stateDir:           DefaultStateDir,
+				controllerMountDir: DefaultControllerMountDir,
+				recoveryInterval:   DefaultRecoveryInterval,
+				showVer:            true,
 			},
 		},
 		{
@@ -608,6 +614,96 @@ func TestRunRecoveryFlags(t *testing.T) {
 			"--config=" + writeConfig(t, validConfig),
 			"--state-dir=" + filepath.Join(t.TempDir(), "staged"),
 			"--recovery-interval=0",
+		}, &stdout, &stderr)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run() = %v, want nil after cancellation (stderr: %q)", err, stderr.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run() did not return within 2s of cancellation")
+	}
+}
+
+// TestDefaultControllerMountDir checks the default and the validation of the flag
+// of the parent volume mount points (D-24).
+func TestDefaultControllerMountDir(t *testing.T) {
+	if DefaultControllerMountDir != "/var/lib/glusterfs-csi/controller" {
+		t.Fatalf("DefaultControllerMountDir = %q, want the documented default", DefaultControllerMountDir)
+	}
+
+	opts, err := parseFlags(nil, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags() = %v, want nil", err)
+	}
+	if opts.controllerMountDir != DefaultControllerMountDir {
+		t.Fatalf("controllerMountDir = %q, want %q", opts.controllerMountDir, DefaultControllerMountDir)
+	}
+
+	// The flag is checked like --state-dir, and the value reaches driver.Options:
+	// a controller start without a mount directory is what New rejects.
+	for _, args := range [][]string{
+		{"--mode=controller", "--controller-mount-dir=relative"},
+		{"--mode=controller", "--controller-mount-dir=/a/../b"},
+		{"--mode=controller", "--controller-mount-dir=/controller/"},
+	} {
+		if checkErr := validateFlags(withArgs(t, args)); checkErr == nil {
+			t.Fatalf("validateFlags(%v) = nil, want an error", args)
+		} else if !strings.Contains(checkErr.Error(), "invalid --controller-mount-dir") {
+			t.Fatalf("validateFlags(%v) = %q, want it to name the flag", args, checkErr)
+		}
+	}
+
+	// An empty value is accepted by the flag handling; driver.New rejects it in
+	// controller mode, which is the message an operator sees.
+	if checkErr := validateFlags(withArgs(t, []string{"--mode=controller", "--controller-mount-dir="})); checkErr != nil {
+		t.Fatalf("validateFlags(--controller-mount-dir=) = %v, want nil", checkErr)
+	}
+	err = run(context.Background(), []string{
+		"--mode=controller",
+		"--endpoint=tcp://127.0.0.1:0",
+		"--config=" + writeConfig(t, validConfig),
+		"--controller-mount-dir=",
+	}, io.Discard, io.Discard)
+	if err == nil {
+		t.Fatal("run() = nil, want an error for a controller without a mount directory")
+	}
+	if !strings.Contains(err.Error(), "controller mount directory") {
+		t.Fatalf("run() = %q, want it to name the mount directory", err)
+	}
+}
+
+// withArgs parses args and returns the resulting options, which validateFlags can
+// then check on its own.
+func withArgs(t *testing.T, args []string) options {
+	t.Helper()
+
+	opts, err := parseFlags(args, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags(%v) = %v, want nil", args, err)
+	}
+	return opts
+}
+
+// TestRunControllerMountDir checks that the flag reaches the driver: a controller
+// start with an explicit mount directory serves until cancellation.
+func TestRunControllerMountDir(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var stdout, stderr bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, []string{
+			"--mode=controller",
+			"--endpoint=tcp://127.0.0.1:0",
+			"--config=" + writeConfig(t, validConfig),
+			"--controller-mount-dir=" + t.TempDir(),
 		}, &stdout, &stderr)
 	}()
 

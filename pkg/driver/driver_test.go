@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -27,12 +28,14 @@ func baseOptions() Options {
 }
 
 // controllerOptions returns a valid option set in controller mode, including
-// the cluster configuration that controller mode requires.
+// the cluster configuration and the mount directory of the parent volumes that
+// controller mode requires (D-24).
 func controllerOptions(t *testing.T) Options {
 	t.Helper()
 
 	opts := baseOptions()
 	opts.Config = testConfigStore(t)
+	opts.ControllerMountDir = t.TempDir()
 	return opts
 }
 
@@ -161,10 +164,10 @@ func TestNew(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			// Every mode requires a configuration, so each case starts with one;
-			// the cases that check the missing-configuration error clear it.
-			opts := baseOptions()
-			opts.Config = testConfigStore(t)
+			// Every mode requires a configuration and controller mode a mount
+			// directory, so each case starts with both; the cases that check the
+			// missing ones clear them.
+			opts := controllerOptions(t)
 			tc.mutate(&opts)
 
 			d, err := New(opts)
@@ -219,6 +222,16 @@ func TestNew(t *testing.T) {
 				if d.controller.locks == nil {
 					t.Fatal("controller.locks = nil, want an in-flight lock table")
 				}
+				if d.controller.parents == nil {
+					t.Fatal("controller.parents = nil, want a parent volume cache")
+				}
+				if d.controller.parents.dir != opts.ControllerMountDir {
+					t.Fatalf("controller.parents.dir = %q, want %q",
+						d.controller.parents.dir, opts.ControllerMountDir)
+				}
+				if d.controller.now == nil {
+					t.Fatal("controller.now = nil, want the real clock")
+				}
 			} else if d.controller != nil {
 				t.Fatal("controller != nil, want no controller service in node mode")
 			}
@@ -241,6 +254,7 @@ func TestNewChecks(t *testing.T) {
 		t.Run(string(tc.mode), func(t *testing.T) {
 			opts := nodeOptions(t)
 			opts.Mode = tc.mode
+			opts.ControllerMountDir = t.TempDir()
 
 			d, err := New(opts)
 			if err != nil {
@@ -411,6 +425,7 @@ func TestNewStateDirAndRecoveryInterval(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			opts := nodeOptions(t)
 			opts.Mode = tc.mode
+			opts.ControllerMountDir = t.TempDir()
 			opts.StateDir = tc.stateDir
 			opts.RecoveryInterval = tc.interval
 
@@ -706,4 +721,141 @@ func TestNewNodeServiceWiring(t *testing.T) {
 	if _, ok := d.node.mounter.(interface{ Detach(string) error }); !ok {
 		t.Fatal("the mounter has no Detach method")
 	}
+}
+
+// TestNewControllerMountDir checks the option the controller mounts the parent
+// volumes below (D-24): required in controller and all mode, absolute and clean,
+// and ignored in node mode.
+func TestNewControllerMountDir(t *testing.T) {
+	tests := []struct {
+		name    string
+		mode    Mode
+		dir     string
+		wantErr string
+	}{
+		{name: "controller mode with a clean absolute path", mode: ModeController, dir: "/var/lib/glusterfs-csi/controller"},
+		{name: "all mode with a clean absolute path", mode: ModeAll, dir: "/var/lib/glusterfs-csi/controller"},
+		{
+			name: "controller mode without a mount directory", mode: ModeController, dir: "",
+			wantErr: "controller mount directory is required",
+		},
+		{
+			name: "all mode without a mount directory", mode: ModeAll, dir: "",
+			wantErr: "controller mount directory is required",
+		},
+		{
+			name: "relative mount directory", mode: ModeController, dir: "controller",
+			wantErr: "must be an absolute path",
+		},
+		{
+			name: "unclean mount directory", mode: ModeController, dir: "/a/../b",
+			wantErr: "must be a clean path",
+		},
+		{
+			name: "mount directory with a trailing slash", mode: ModeController, dir: "/controller/",
+			wantErr: "must be a clean path",
+		},
+		{
+			// Node mode never mounts a parent volume, so an empty value is the
+			// normal case there.
+			name: "node mode without a mount directory", mode: ModeNode, dir: "",
+		},
+		{
+			// A value that is set is still checked, so that a typo in the
+			// Deployment does not stay hidden until the mode changes.
+			name: "node mode with an unclean mount directory", mode: ModeNode, dir: "/a/../b",
+			wantErr: "must be a clean path",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := nodeOptions(t)
+			opts.Mode = tc.mode
+			opts.ControllerMountDir = tc.dir
+
+			d, err := New(opts)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("New() = %+v, nil, want an error containing %q", d, tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("New() = %q, want an error containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("New() = %v, want nil", err)
+			}
+			if tc.mode.runsController() {
+				if got := d.controller.parents.dir; got != tc.dir {
+					t.Fatalf("parents.dir = %q, want %q", got, tc.dir)
+				}
+				return
+			}
+			if d.controller != nil {
+				t.Fatal("controller != nil in node mode, want no parent volume mounts")
+			}
+		})
+	}
+}
+
+// TestServeClosesParentMounts checks that Serve unmounts the parent volumes the
+// controller mounted once the gRPC server stopped: the plugin must not leave a
+// FUSE mount behind on every restart of the Deployment.
+func TestServeClosesParentMounts(t *testing.T) {
+	d := mustControllerDriver(t)
+	fake := &fakeMounter{mountState: mounter.MountStateNotMounted, trackState: true}
+	fake.onCreate = func(target string) error { return os.MkdirAll(target, 0o750) }
+	d.controller.parents = newParentMounts(fake, t.TempDir())
+
+	lis := bufconn.Listen(bufSize)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	served := make(chan error, 1)
+	go func() { served <- d.Serve(ctx, lis) }()
+
+	if !waitFor(t, 5*time.Second, func() bool {
+		_, err := d.controller.parents.root(context.Background(), testCluster, "vol")
+		return err == nil
+	}) {
+		t.Fatal("could not mount a parent volume before the server was stopped")
+	}
+	cancel()
+
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("Serve() = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve() did not return within 5s of cancellation")
+	}
+
+	if got := fake.unmountCount(); got != 1 {
+		t.Fatalf("Unmount calls = %d (%v), want 1", got, fake.unmountCalls)
+	}
+	if want := d.controller.parents.mountPath("c1", "vol"); fake.unmountCalls[0] != want {
+		t.Fatalf("Unmount target = %q, want %q", fake.unmountCalls[0], want)
+	}
+	if err := lis.Close(); err != nil {
+		t.Fatalf("Close() = %v, want nil", err)
+	}
+}
+
+// TestCloseParentMountsWithoutController checks the shutdown helper of the modes
+// that run no controller service: it must be a no-op instead of dereferencing a
+// missing service.
+func TestCloseParentMountsWithoutController(t *testing.T) {
+	d, err := New(nodeOptions(t))
+	if err != nil {
+		t.Fatalf("New() = %v, want nil", err)
+	}
+	d.closeParentMounts()
+
+	if (&Driver{}).controller != nil {
+		t.Fatal("a hand-built Driver has a controller service")
+	}
+	(&Driver{}).closeParentMounts()
 }

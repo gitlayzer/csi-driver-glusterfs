@@ -106,6 +106,10 @@ type fakeMounter struct {
 	// onUnmount is the same hook for Unmount, which the corrupted staging path of
 	// NodeStageVolume uses instead of Detach.
 	onUnmount func(target string)
+	// onCreate is called by a successful MountGlusterfs before the lock is
+	// released. A test of the controller side uses it to create the mount point,
+	// which a real mount does in the kernel.
+	onCreate func(target string) error
 	// trackState makes VolumeMountState answer from the state the successful
 	// mount calls of the fake left behind, so that a test can run two recovery
 	// passes over the same fake. It is off by default: the tests that inject one
@@ -172,6 +176,9 @@ func (f *fakeMounter) MountGlusterfs(_ context.Context, spec mounter.Spec, targe
 	f.record("mount:" + target)
 	if err == nil {
 		f.setState(target, mounter.MountStateMounted)
+	}
+	if hook := f.onCreate; err == nil && hook != nil {
+		err = hook(target)
 	}
 	return err
 }
@@ -332,6 +339,13 @@ func (f *fakeMounter) cleanupCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.cleanupCalls)
+}
+
+// detachCount returns how often Detach was called.
+func (f *fakeMounter) detachCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.detachCalls)
 }
 
 // mountStateCount returns how often VolumeMountState was called.
