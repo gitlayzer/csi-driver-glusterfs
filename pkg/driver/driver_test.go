@@ -15,7 +15,8 @@ import (
 )
 
 // baseOptions returns a valid option set in controller mode: the mode with the
-// fewest requirements, so each test can vary exactly one field.
+// fewest requirements, so each test can vary exactly one field. It includes the
+// cluster configuration, which every mode requires.
 func baseOptions() Options {
 	return Options{
 		DriverName: "glusterfs.csi.io",
@@ -23,6 +24,16 @@ func baseOptions() Options {
 		Mode:       ModeController,
 		Version:    "v0.1.0",
 	}
+}
+
+// controllerOptions returns a valid option set in controller mode, including
+// the cluster configuration that controller mode requires.
+func controllerOptions(t *testing.T) Options {
+	t.Helper()
+
+	opts := baseOptions()
+	opts.Config = testConfigStore(t)
+	return opts
 }
 
 // nodeOptions returns a valid option set in node mode, including the cluster
@@ -83,8 +94,9 @@ func TestNew(t *testing.T) {
 			wantErr: "cluster configuration is required",
 		},
 		{
-			name:   "controller mode without a configuration",
-			mutate: func(o *Options) { o.Config = nil },
+			name:    "controller mode without a configuration",
+			mutate:  func(o *Options) { o.Config = nil },
+			wantErr: "cluster configuration is required",
 		},
 		{
 			name:    "relative mount log directory",
@@ -149,8 +161,8 @@ func TestNew(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			// Node and all mode need a configuration, so every case starts with
-			// one; the cases that check the missing-configuration error clear it.
+			// Every mode requires a configuration, so each case starts with one;
+			// the cases that check the missing-configuration error clear it.
 			opts := baseOptions()
 			opts.Config = testConfigStore(t)
 			tc.mutate(&opts)
@@ -181,8 +193,8 @@ func TestNew(t *testing.T) {
 			if d.mode != opts.Mode {
 				t.Fatalf("mode = %q, want %q", d.mode, opts.Mode)
 			}
-			if d.controllerRegistered {
-				t.Fatal("controllerRegistered = true, want false")
+			if want := opts.Mode == ModeController || opts.Mode == ModeAll; d.controllerRegistered != want {
+				t.Fatalf("controllerRegistered = %t, want %t in %q mode", d.controllerRegistered, want, opts.Mode)
 			}
 			if want := opts.Mode == ModeNode || opts.Mode == ModeAll; d.nodeRegistered != want {
 				t.Fatalf("nodeRegistered = %t, want %t in %q mode", d.nodeRegistered, want, opts.Mode)
@@ -195,7 +207,20 @@ func TestNew(t *testing.T) {
 					t.Fatalf("node.logDir = %q, want %q", d.node.logDir, opts.MountLogDir)
 				}
 			} else if d.node != nil {
-				t.Fatal("node != nil, want no node service in controller mode")
+				t.Fatal("node != nil, want no node service in node mode")
+			}
+			if opts.Mode == ModeController || opts.Mode == ModeAll {
+				if d.controller == nil {
+					t.Fatal("controller = nil, want a controller service in controller and all mode")
+				}
+				if d.controller.driver != d {
+					t.Fatal("controller.driver = not the driver, want the driver")
+				}
+				if d.controller.locks == nil {
+					t.Fatal("controller.locks = nil, want an in-flight lock table")
+				}
+			} else if d.controller != nil {
+				t.Fatal("controller != nil, want no controller service in node mode")
 			}
 		})
 	}
@@ -253,7 +278,7 @@ func TestNewVersionFallback(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			opts := baseOptions()
+			opts := controllerOptions(t)
 			opts.Version = tc.version
 
 			d, err := New(opts)
@@ -278,23 +303,28 @@ func TestNewVersionFallback(t *testing.T) {
 	}
 }
 
-// TestNewGRPCServerControllerModeMismatch checks the guard that keeps a future
-// task from advertising a controller service that the mode does not run.
+// TestNewGRPCServerControllerModeMismatch checks the guard that keeps a driver
+// from registering a service in a mode that does not run it, and that a
+// registered service is always built.
 func TestNewGRPCServerControllerModeMismatch(t *testing.T) {
-	opts := nodeOptions(t)
-
-	d, err := New(opts)
+	d, err := New(nodeOptions(t))
 	if err != nil {
 		t.Fatalf("New() = %v, want nil", err)
 	}
-	d.controllerRegistered = true
 
+	// A flag without a service would register a typed nil that answers every
+	// RPC with a nil response instead of an error.
+	d.controllerRegistered = true
+	if _, srvErr := d.newGRPCServer(); srvErr == nil {
+		t.Fatal("newGRPCServer() = nil error, want an error for controller service in node mode")
+	}
+	d.controller = &controllerService{driver: d, locks: newInflight()}
 	if _, srvErr := d.newGRPCServer(); srvErr == nil {
 		t.Fatal("newGRPCServer() = nil error, want an error for controller service in node mode")
 	}
 
 	d.mode = ModeController
-	// Clearing the flag is what a driver built in controller mode looks like;
+	// Clearing the flags is what a driver built in controller mode looks like;
 	// the mode alone does not unregister a service.
 	d.nodeRegistered = false
 	d.node = nil
@@ -304,6 +334,20 @@ func TestNewGRPCServerControllerModeMismatch(t *testing.T) {
 	}
 	if srv == nil {
 		t.Fatal("newGRPCServer() = nil server, want a server")
+	}
+}
+
+// TestNewGRPCServerNodeServiceNotBuilt checks the guard for a node registration
+// flag without a node service.
+func TestNewGRPCServerNodeServiceNotBuilt(t *testing.T) {
+	d, err := New(nodeOptions(t))
+	if err != nil {
+		t.Fatalf("New() = %v, want nil", err)
+	}
+	d.node = nil
+
+	if _, srvErr := d.newGRPCServer(); srvErr == nil {
+		t.Fatal("newGRPCServer() = nil error, want an error for a registered node service that is not built")
 	}
 }
 
@@ -440,7 +484,7 @@ func recoveryDriver(t *testing.T) (*Driver, *fakeMounter, *recordStore) {
 // function waits for it and may be called twice.
 func TestStartRecovery(t *testing.T) {
 	t.Run("controller mode starts no goroutine", func(t *testing.T) {
-		d, err := New(baseOptions())
+		d, err := New(controllerOptions(t))
 		if err != nil {
 			t.Fatalf("New() = %v, want nil", err)
 		}

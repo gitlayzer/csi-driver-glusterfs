@@ -81,7 +81,7 @@ func bufconnConn(t *testing.T, d *Driver) *grpc.ClientConn {
 
 // TestIdentityGetPluginInfo covers GetPluginInfo over gRPC.
 func TestIdentityGetPluginInfo(t *testing.T) {
-	opts := baseOptions()
+	opts := controllerOptions(t)
 	opts.DriverName = "example.csi.io"
 	opts.Version = "v9.9.9"
 
@@ -106,32 +106,41 @@ func TestIdentityGetPluginInfo(t *testing.T) {
 	}
 }
 
-// TestIdentityGetPluginCapabilities covers the capability list.
+// TestIdentityGetPluginCapabilities covers the capability list per mode: the
+// CONTROLLER_SERVICE capability is derived from the registered services, so
+// node mode must not announce it.
 func TestIdentityGetPluginCapabilities(t *testing.T) {
 	tests := []struct {
 		name             string
-		controllerReg    bool
+		mode             Mode
 		wantCapabilities []csi.PluginCapability_Service_Type
 	}{
 		{
-			name:             "no controller service registered",
-			controllerReg:    false,
+			name:             "node mode registers no controller service",
+			mode:             ModeNode,
 			wantCapabilities: nil,
 		},
 		{
-			name:             "controller service registered",
-			controllerReg:    true,
+			name:             "controller mode registers the controller service",
+			mode:             ModeController,
+			wantCapabilities: []csi.PluginCapability_Service_Type{csi.PluginCapability_Service_CONTROLLER_SERVICE},
+		},
+		{
+			name:             "all mode registers the controller service",
+			mode:             ModeAll,
 			wantCapabilities: []csi.PluginCapability_Service_Type{csi.PluginCapability_Service_CONTROLLER_SERVICE},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			d, err := New(baseOptions())
+			opts := nodeOptions(t)
+			opts.Mode = tc.mode
+
+			d, err := New(opts)
 			if err != nil {
 				t.Fatalf("New() = %v, want nil", err)
 			}
-			d.controllerRegistered = tc.controllerReg
 			client := identityServer(t, d)
 
 			resp, err := client.GetPluginCapabilities(context.Background(), &csi.GetPluginCapabilitiesRequest{})

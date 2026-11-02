@@ -1,6 +1,8 @@
 package driver
 
 import (
+	"fmt"
+
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -8,8 +10,9 @@ import (
 	"github.com/gitlayzer/csi-driver-glusterfs/pkg/mounter"
 )
 
-// supportedAccessModes are the VolumeCapability access modes the node service
-// accepts, i.e. every mode of csi.proto except UNKNOWN.
+// supportedAccessModes are the VolumeCapability access modes the driver
+// accepts, i.e. every mode of csi.proto except UNKNOWN. Both the node and the
+// controller service use the table, through checkCapabilityShape.
 //
 // GlusterFS volumes are natively read-write-many, so no mode has to be refused
 // for backend reasons: the single node restriction of the SINGLE_NODE_* modes
@@ -65,6 +68,55 @@ type nodeCapability struct {
 	mountFlags []string
 }
 
+// capabilityShape is a VolumeCapability whose malformed parts have been
+// rejected, classified by access type.
+type capabilityShape struct {
+	// mode is the access mode. It is always one of supportedAccessModes.
+	mode csi.VolumeCapability_AccessMode_Mode
+	// block is true when the requested access type is Block.
+	block bool
+	// mount is the mount access type, nil for a Block capability.
+	mount *csi.VolumeCapability_MountVolume
+}
+
+// checkCapabilityShape rejects the parts of a VolumeCapability that are
+// malformed for the Controller and for the Node service alike: a missing
+// access mode, an access mode the protocol does not define and a missing
+// access type.
+//
+// Whether an access type is supported depends on the service: the Controller
+// answers InvalidArgument for Block, the Node service FailedPrecondition
+// (D-16). The shape therefore only classifies the access type and lets the
+// caller decide, so that the classification exists exactly once.
+func checkCapabilityShape(c *csi.VolumeCapability) (capabilityShape, error) {
+	if c == nil {
+		return capabilityShape{}, status.Error(codes.InvalidArgument, "volume capability is required")
+	}
+
+	mode := c.GetAccessMode()
+	if mode == nil {
+		return capabilityShape{}, status.Error(codes.InvalidArgument, "volume capability access mode is required")
+	}
+	if mode.GetMode() == csi.VolumeCapability_AccessMode_UNKNOWN {
+		return capabilityShape{}, status.Errorf(codes.InvalidArgument,
+			"volume capability access mode %s is not supported", mode.GetMode().String())
+	}
+	if _, ok := supportedAccessModes[mode.GetMode()]; !ok {
+		return capabilityShape{}, status.Errorf(codes.InvalidArgument,
+			"volume capability access mode %d is not defined by the CSI specification", int32(mode.GetMode()))
+	}
+
+	switch c.GetAccessType().(type) {
+	case *csi.VolumeCapability_Block:
+		return capabilityShape{mode: mode.GetMode(), block: true}, nil
+	case *csi.VolumeCapability_Mount:
+		return capabilityShape{mode: mode.GetMode(), mount: c.GetMount()}, nil
+	default:
+		// No access type at all, or a oneof case a future protocol version adds.
+		return capabilityShape{}, status.Error(codes.InvalidArgument, "volume capability access type is required")
+	}
+}
+
 // validateNodeCapability returns a gRPC status error on failure.
 //
 // A malformed capability (no access mode, an unknown access mode, no access
@@ -72,45 +124,50 @@ type nodeCapability struct {
 // understands but does not support is FailedPrecondition, which is what the
 // CSI spec calls "Exceeds capabilities" for the node RPCs.
 func validateNodeCapability(c *csi.VolumeCapability) (nodeCapability, error) {
-	if c == nil {
-		return nodeCapability{}, status.Error(codes.InvalidArgument, "volume capability is required")
+	shape, err := checkCapabilityShape(c)
+	if err != nil {
+		return nodeCapability{}, err
 	}
-
-	mode := c.GetAccessMode()
-	if mode == nil {
-		return nodeCapability{}, status.Error(codes.InvalidArgument, "volume capability access mode is required")
-	}
-	if mode.GetMode() == csi.VolumeCapability_AccessMode_UNKNOWN {
-		return nodeCapability{}, status.Errorf(codes.InvalidArgument,
-			"volume capability access mode %s is not supported", mode.GetMode().String())
-	}
-	if _, ok := supportedAccessModes[mode.GetMode()]; !ok {
-		return nodeCapability{}, status.Errorf(codes.InvalidArgument,
-			"volume capability access mode %d is not defined by the CSI specification", int32(mode.GetMode()))
-	}
-
-	switch c.GetAccessType().(type) {
-	case nil:
-		return nodeCapability{}, status.Error(codes.InvalidArgument, "volume capability access type is required")
-	case *csi.VolumeCapability_Block:
+	if shape.block {
 		return nodeCapability{}, status.Error(codes.FailedPrecondition, "block access type is not supported")
-	case *csi.VolumeCapability_Mount:
-		// The mount type is the only kind this driver supports; the fs_type is
-		// checked below.
 	}
 
-	if fsType := c.GetMount().GetFsType(); fsType != "" && fsType != mounter.FSType {
+	if fsType := shape.mount.GetFsType(); fsType != "" && fsType != mounter.FSType {
 		return nodeCapability{}, status.Errorf(codes.FailedPrecondition,
 			"file system type %q is not supported, only %q is", fsType, mounter.FSType)
 	}
 
-	_, readOnly := readerOnlyAccessModes[mode.GetMode()]
-	_, singleTarget := singleTargetAccessModes[mode.GetMode()]
+	_, readOnly := readerOnlyAccessModes[shape.mode]
+	_, singleTarget := singleTargetAccessModes[shape.mode]
 	return nodeCapability{
 		readOnly:     readOnly,
 		singleTarget: singleTarget,
 		// Copied so that the caller never shares memory with the request, which
 		// the gRPC layer may reuse after the handler returns.
-		mountFlags: append([]string(nil), c.GetMount().GetMountFlags()...),
+		mountFlags: append([]string(nil), shape.mount.GetMountFlags()...),
 	}, nil
+}
+
+// checkControllerCapability validates c for the controller service. A
+// malformed capability is an InvalidArgument status error. A well formed one
+// the driver does not support returns supported=false and the reason, which
+// ValidateVolumeCapabilities reports in its message and CreateVolume (T-11)
+// turns into InvalidArgument.
+//
+// The mount flags are not checked here: they are validated by building the
+// mount arguments of the volume, which needs the cluster and the volume id.
+func checkControllerCapability(c *csi.VolumeCapability) (supported bool, reason string, err error) {
+	shape, err := checkCapabilityShape(c)
+	if err != nil {
+		return false, "", err
+	}
+
+	if shape.block {
+		return false, "block access type is not supported", nil
+	}
+	if fsType := shape.mount.GetFsType(); fsType != "" && fsType != mounter.FSType {
+		return false, fmt.Sprintf("file system type %q is not supported, only %q is",
+			fsType, mounter.FSType), nil
+	}
+	return true, "", nil
 }

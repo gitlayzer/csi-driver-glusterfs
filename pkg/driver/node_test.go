@@ -2452,7 +2452,7 @@ func TestNodeGetInfo(t *testing.T) {
 // TestNodeServiceNotRegisteredInControllerMode checks that controller mode serves
 // no Node service at all.
 func TestNodeServiceNotRegisteredInControllerMode(t *testing.T) {
-	d, err := New(baseOptions())
+	d, err := New(controllerOptions(t))
 	if err != nil {
 		t.Fatalf("New() = %v, want nil", err)
 	}
@@ -2465,7 +2465,7 @@ func TestNodeServiceNotRegisteredInControllerMode(t *testing.T) {
 // TestNewGRPCServerNodeModeMismatch checks the guard that keeps a driver from
 // registering the node service in a mode that does not run it.
 func TestNewGRPCServerNodeModeMismatch(t *testing.T) {
-	d, err := New(baseOptions())
+	d, err := New(controllerOptions(t))
 	if err != nil {
 		t.Fatalf("New() = %v, want nil", err)
 	}
@@ -2477,6 +2477,10 @@ func TestNewGRPCServerNodeModeMismatch(t *testing.T) {
 	}
 
 	d.mode = ModeNode
+	// Clearing the controller registration is what a driver built in node mode
+	// looks like; the mode alone does not unregister a service.
+	d.controllerRegistered = false
+	d.controller = nil
 	srv, err := d.newGRPCServer()
 	if err != nil {
 		t.Fatalf("newGRPCServer() = %v, want nil in node mode", err)

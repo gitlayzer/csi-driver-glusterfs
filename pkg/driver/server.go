@@ -39,21 +39,31 @@ const (
 )
 
 // newGRPCServer builds the gRPC server and registers every service the mode
-// provides. It is the single registration point later tasks hook into: adding
-// the Controller service here and setting controllerRegistered is all T-10
-// needs.
+// provides. It is the single registration point of the package: the Identity
+// service is always served, the Controller service in controller and all mode
+// and the Node service in node and all mode.
 func (d *Driver) newGRPCServer() (*grpc.Server, error) {
 	srv := grpc.NewServer(grpc.ChainUnaryInterceptor(recoverInterceptor, logInterceptor))
 
 	csi.RegisterIdentityServer(srv, d)
 
-	// T-10 registers the Controller service here and sets
-	// d.controllerRegistered = true; T-06 does the same for the Node service.
 	if d.controllerRegistered && !d.mode.runsController() {
 		return nil, fmt.Errorf("mode %q cannot register the controller service", d.mode)
 	}
 	if d.nodeRegistered && !d.mode.runsNode() {
 		return nil, fmt.Errorf("mode %q cannot register the node service", d.mode)
+	}
+	// A registered flag without a service would register a typed nil, which
+	// answers every RPC with a nil response instead of an error. New never
+	// produces that state; the check keeps a hand-built Driver from hiding it.
+	if d.controllerRegistered && d.controller == nil {
+		return nil, errors.New("controller service is registered but not built")
+	}
+	if d.nodeRegistered && d.node == nil {
+		return nil, errors.New("node service is registered but not built")
+	}
+	if d.controllerRegistered {
+		csi.RegisterControllerServer(srv, d.controller)
 	}
 	if d.nodeRegistered {
 		csi.RegisterNodeServer(srv, d.node)

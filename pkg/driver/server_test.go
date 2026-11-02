@@ -60,7 +60,7 @@ func makeStaleSocket(t *testing.T, path string) {
 func unixDriver(t *testing.T, path string) *Driver {
 	t.Helper()
 
-	opts := baseOptions()
+	opts := controllerOptions(t)
 	opts.Endpoint = "unix://" + path
 
 	d, err := New(opts)
@@ -133,8 +133,8 @@ func TestServeUnixSocket(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetPluginInfo() = %v, want nil", err)
 		}
-		if resp.GetName() != baseOptions().DriverName {
-			t.Fatalf("GetPluginInfo().Name = %q, want %q", resp.GetName(), baseOptions().DriverName)
+		if resp.GetName() != controllerOptions(t).DriverName {
+			t.Fatalf("GetPluginInfo().Name = %q, want %q", resp.GetName(), controllerOptions(t).DriverName)
 		}
 
 		cancel()
@@ -232,7 +232,7 @@ func TestServeUnixSocket(t *testing.T) {
 // TestServeTCP covers the TCP endpoint path and checks that nothing is written
 // to the filesystem.
 func TestServeTCP(t *testing.T) {
-	opts := baseOptions()
+	opts := controllerOptions(t)
 	opts.Endpoint = "tcp://127.0.0.1:0"
 
 	d, err := New(opts)
@@ -278,7 +278,7 @@ func TestServeTCP(t *testing.T) {
 // TestServeListenerError checks that a closed listener is reported as an error
 // instead of being mistaken for a shutdown.
 func TestServeListenerError(t *testing.T) {
-	opts := baseOptions()
+	opts := controllerOptions(t)
 	d, err := New(opts)
 	if err != nil {
 		t.Fatalf("New() = %v, want nil", err)

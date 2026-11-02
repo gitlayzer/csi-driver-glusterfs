@@ -1,9 +1,9 @@
-// Package driver implements the CSI plugin: the gRPC server, the Identity
-// service and the process lifecycle of the glusterfs-csi binary.
+// Package driver implements the CSI plugin: the gRPC server, the Identity,
+// Controller and Node services and the process lifecycle of the glusterfs-csi
+// binary.
 //
-// The package is deliberately thin. The Controller service is added by a later
-// task; the Controller and Node services register themselves on the same
-// [Driver] and are reached through the same gRPC server, so the plugin
+// The package is deliberately thin. The services register themselves on the
+// same [Driver] and are reached through the same gRPC server, so the plugin
 // capability list is derived from what is actually registered instead of being
 // hard-coded (docs/architecture.md §5.4).
 package driver
@@ -117,8 +117,10 @@ type Options struct {
 	// Version is the build version, normally version.Get().Version.
 	Version string
 	// Config is the live cluster configuration. The Node and Controller
-	// services read it and main keeps it up to date. It is required in node and
-	// all mode, because NodeStageVolume needs the servers of a cluster.
+	// services read it and main keeps it up to date. It is required in
+	// controller, node and all mode: NodeStageVolume looks the servers of a
+	// cluster up by clusterID, and the controller RPCs decide whether a volume
+	// exists by asking whether its cluster is configured (D-23).
 	Config *config.Store
 	// MountLogDir is the directory of the per-volume glusterfs mount logs; empty
 	// disables log-file.
@@ -131,9 +133,9 @@ type Options struct {
 	RecoveryInterval time.Duration
 }
 
-// Driver is the CSI plugin. It implements the Identity service and, once later
-// tasks add it, the Controller service; the Node service is registered through
-// the node field in node and all mode.
+// Driver is the CSI plugin. It implements the Identity service; the Controller
+// service is registered through the controller field and the Node service
+// through the node field, each only in the modes that run it.
 //
 // A Driver is safe for concurrent use: the registration flags are only written
 // before the gRPC server starts, and everything else is read-only afterwards.
@@ -150,8 +152,14 @@ type Driver struct {
 	endpoint   string
 
 	// controllerRegistered is true when the Controller service is registered.
-	// GetPluginCapabilities is derived from it. T-10 sets it.
+	// GetPluginCapabilities is derived from it.
 	controllerRegistered bool
+
+	// controller is the Controller service, nil unless the mode runs it. It is
+	// not embedded in Driver for the same reason as node: the generated
+	// Unimplemented*Server types all define testEmbeddedByValue, so embedding
+	// more than one of them would make every selector on them ambiguous.
+	controller *controllerService
 
 	// node is the Node service, nil unless the mode runs it. It is not embedded
 	// in Driver: UnimplementedIdentityServer and UnimplementedNodeServer both
@@ -198,9 +206,12 @@ func New(opts Options) (*Driver, error) {
 		return nil, fmt.Errorf("node id is required in %q mode", mode)
 	}
 
-	// NodeStageVolume looks the servers of a volume up by clusterID, so a node
-	// plugin without a configuration could never stage anything.
-	if mode.runsNode() && opts.Config == nil {
+	// Every mode needs the cluster configuration, for two reasons a step apart:
+	// NodeStageVolume looks the servers of a volume up by clusterID, and the
+	// controller RPCs decide whether a volume exists by asking whether its
+	// cluster is configured (D-23). A plugin without a configuration could never
+	// stage anything and would report every volume as NotFound.
+	if opts.Config == nil {
 		return nil, fmt.Errorf("cluster configuration is required in %q mode", mode)
 	}
 
@@ -232,6 +243,11 @@ func New(opts Options) (*Driver, error) {
 	}
 	d.identityService = identityService{driver: d}
 	d.checks = d.readinessChecks()
+
+	if mode.runsController() {
+		d.controller = &controllerService{driver: d, locks: newInflight()}
+		d.controllerRegistered = true
+	}
 
 	if mode.runsNode() {
 		d.node = &nodeService{
@@ -396,7 +412,8 @@ func validateStateDir(dir string) error {
 // and is reported by NodeGetInfo.
 func (d *Driver) NodeID() string { return d.nodeID }
 
-// Config returns the cluster configuration store. It is nil in controller mode
-// unless one was passed; the Node service (T-06) requires it and the Controller
-// service (T-10) handles a nil store.
+// Config returns the cluster configuration store. It is required by [New] in
+// every mode, so it is never nil for a Driver that New returned; the Controller
+// and Node services still guard against a nil store, because a Driver built by
+// hand in a test may not have one.
 func (d *Driver) Config() *config.Store { return d.config }
