@@ -1,0 +1,165 @@
+# Node DaemonSet of glusterfs-csi: FUSE mounts, kubelet registration and liveness on every Linux node.
+#
+# All hostPath volumes assume the kubelet root directory is /var/lib/kubelet.
+# Distributions that use another path (k3s, microk8s, ...) need a patched copy of
+# this DaemonSet.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: glusterfs-csi-node
+  labels:
+    app.kubernetes.io/name: glusterfs-csi
+    app.kubernetes.io/part-of: glusterfs-csi
+    app.kubernetes.io/component: node
+spec:
+  # Restarting the plugin container tears down every GlusterFS mount of the
+  # node (the FUSE processes live in that container), so a rolling update would
+  # break the I/O of all pods at once. An administrator deletes the pods node by
+  # node instead, after draining the workloads of that node.
+  updateStrategy:
+    type: OnDelete
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: glusterfs-csi
+      app.kubernetes.io/component: node
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: glusterfs-csi
+        app.kubernetes.io/part-of: glusterfs-csi
+        app.kubernetes.io/component: node
+    spec:
+      serviceAccountName: glusterfs-csi-node
+      # The node plugin never talks to the Kubernetes API: its configuration
+      # comes from the mounted ConfigMap file.
+      automountServiceAccountToken: false
+      # The FUSE client has to resolve the Gluster server host names (D-21).
+      # With hostNetwork the pod gets the /etc/hosts the kubelet copies from the
+      # node, so any name the node can resolve also works inside the container.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-node-critical
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: glusterfs-csi
+          image: ghcr.io/gitlayzer/glusterfs-csi:main
+          imagePullPolicy: IfNotPresent
+          # Every flag is spelled out even where it matches the default, so the
+          # values can be compared against the volumeMount paths below.
+          args:
+            - --mode=node
+            - --endpoint=unix:///csi/csi.sock
+            - --nodeid=$(NODE_ID)
+            - --config=/etc/glusterfs-csi/config.json
+            - --state-dir=/var/lib/kubelet/plugins/glusterfs.csi.io/staged
+            - --recovery-interval=60s
+            - --mount-log-dir=/var/log/glusterfs/csi
+            - --v=2
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          # /dev/fuse and the Bidirectional mount propagation of the kubelet
+          # directory both require a privileged container.
+          securityContext:
+            privileged: true
+          ports:
+            - name: healthz
+              containerPort: 29651
+              protocol: TCP
+          # A failed probe restarts the container, which disconnects every mount
+          # of this node; the thresholds are therefore generous.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 5
+          # No limits on purpose: the FUSE processes run in this container and
+          # an OOM kill would disconnect every GlusterFS mount of the node.
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: kubelet-dir
+              mountPath: /var/lib/kubelet
+              mountPropagation: Bidirectional
+            - name: config
+              mountPath: /etc/glusterfs-csi
+              readOnly: true
+            - name: mount-log
+              mountPath: /var/log/glusterfs/csi
+        - name: node-driver-registrar
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0
+          args:
+            - --v=2
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path=/var/lib/kubelet/plugins/glusterfs.csi.io/csi.sock
+          livenessProbe:
+            exec:
+              command:
+                - /csi-node-driver-registrar
+                - --kubelet-registration-path=/var/lib/kubelet/plugins/glusterfs.csi.io/csi.sock
+                - --mode=kubelet-registration-probe
+            initialDelaySeconds: 30
+            periodSeconds: 90
+            timeoutSeconds: 15
+          resources:
+            requests:
+              cpu: 10m
+              memory: 20Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: liveness-probe
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.20.0
+          args:
+            - --v=2
+            - --csi-address=/csi/csi.sock
+            - --http-endpoint=:29651
+            - --probe-timeout=5s
+          resources:
+            requests:
+              cpu: 10m
+              memory: 20Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+      volumes:
+        - name: socket-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/glusterfs.csi.io
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: /var/lib/kubelet
+            type: Directory
+        # Mounted as a directory, without "optional" and without "items" (no
+        # subPath either): only then does the kubelet update the file in place
+        # when the ConfigMap changes, which the driver hot-reloads.
+        - name: config
+          configMap:
+            name: glusterfs-csi-config
+        - name: mount-log
+          hostPath:
+            path: /var/log/glusterfs/csi
+            type: DirectoryOrCreate

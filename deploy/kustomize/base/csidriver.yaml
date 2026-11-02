@@ -1,0 +1,16 @@
+# CSIDriver object: no attach/detach phase and only Persistent filesystem volumes (architecture.md §3).
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: glusterfs.csi.io
+  labels:
+    app.kubernetes.io/name: glusterfs-csi
+    app.kubernetes.io/part-of: glusterfs-csi
+spec:
+  attachRequired: false
+  podInfoOnMount: false
+  fsGroupPolicy: File
+  volumeLifecycleModes:
+    - Persistent
+  requiresRepublish: false
+  storageCapacity: false

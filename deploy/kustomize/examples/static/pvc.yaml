@@ -1,0 +1,13 @@
+# Claim that statically binds the example PV (empty storageClassName, explicit volumeName).
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-data
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: ""
+  volumeName: glusterfs-static-example
+  resources:
+    requests:
+      storage: 10Gi

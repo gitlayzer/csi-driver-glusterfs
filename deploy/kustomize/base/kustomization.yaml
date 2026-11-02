@@ -1,0 +1,20 @@
+# Base: namespace, CSIDriver, ServiceAccount and the node DaemonSet of glusterfs-csi.
+#
+# The base intentionally does NOT contain the glusterfs-csi-config ConfigMap: it
+# has to be provided by an overlay (see overlays/sample). Without it the "config"
+# volume of the node DaemonSet cannot be resolved and the pods stay in
+# ContainerCreating.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: glusterfs-csi
+
+resources:
+  - namespace.yaml
+  - csidriver.yaml
+  - serviceaccount.yaml
+  - node-daemonset.yaml
+
+images:
+  - name: ghcr.io/gitlayzer/glusterfs-csi
+    newTag: main

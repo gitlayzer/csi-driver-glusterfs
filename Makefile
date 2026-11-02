@@ -29,7 +29,7 @@ GOFLAGS   ?=
 GOLANGCI  ?= golangci-lint
 DOCKER    ?= docker
 
-.PHONY: all build test lint vet fmt image clean help
+.PHONY: all build test lint vet fmt image verify-manifests clean help
 
 all: build
 
@@ -60,6 +60,10 @@ image:
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg BUILD_DATE=$(BUILD_DATE) \
 		-t $(IMAGE):$(TAG) .
+
+## verify-manifests: render the kustomize manifests and validate them with kubeconform
+verify-manifests:
+	hack/verify-manifests.sh
 
 ## clean: remove build artifacts
 clean:

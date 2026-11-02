@@ -1,0 +1,26 @@
+# Sample overlay: the base plus the glusterfs-csi-config ConfigMap the node plugin needs.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: glusterfs-csi
+
+resources:
+  - ../../base
+
+configMapGenerator:
+  # No content hash suffix (disableNameSuffixHash): the DaemonSet uses
+  # updateStrategy OnDelete, so a renamed ConfigMap would not roll the pods, it
+  # would only leave them pointing at a stale volume. The driver instead
+  # hot-reloads changes of the same-named ConfigMap file (about 10s, plus the
+  # kubelet sync period).
+  - name: glusterfs-csi-config
+    files:
+      - config.json
+    options:
+      disableNameSuffixHash: true
+
+images:
+  # Replace "main" with a pinned build in real deployments: sha-<short sha> (as
+  # published by the image workflow) or a release version.
+  - name: ghcr.io/gitlayzer/glusterfs-csi
+    newTag: main

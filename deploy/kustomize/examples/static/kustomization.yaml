@@ -1,0 +1,11 @@
+# Example overlay: one static GlusterFS PV, its PVC and three writers that share it.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: glusterfs-csi-example
+
+resources:
+  - namespace.yaml
+  - pv.yaml
+  - pvc.yaml
+  - deployment.yaml

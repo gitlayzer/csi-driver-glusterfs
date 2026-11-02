@@ -1,0 +1,10 @@
+[
+  {
+    "clusterID": "prod",
+    "servers": [
+      "gluster-1.example.com",
+      "gluster-2.example.com",
+      "gluster-3.example.com"
+    ]
+  }
+]

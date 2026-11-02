@@ -1,0 +1,80 @@
+# Three writer pods that share the static RWX volume and log to one file each.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rwx-writer
+  labels:
+    app.kubernetes.io/name: rwx-writer
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rwx-writer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rwx-writer
+    spec:
+      # Spread the replicas over distinct nodes: the point of the example is
+      # concurrent writes from several hosts into the same GlusterFS volume.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: rwx-writer
+      containers:
+        - name: writer
+          image: docker.io/library/busybox:1.37.0
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          # One line per 5s: UTC time, node, pod, increasing sequence number.
+          command:
+            - sh
+            - -c
+            - |
+              i=0
+              while true; do
+                i=$((i + 1))
+                printf '%s %s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$NODE_NAME" "$POD_NAME" "$i" >> "/data/${POD_NAME}.log"
+                sleep 5
+              done
+          # Fallback for pods that do not get a working mount back after an
+          # in-place remount: ls fails while the volume is unusable and the
+          # restart re-creates the mount namespace. With HostToContainer it
+          # normally never triggers (D-19).
+          livenessProbe:
+            exec:
+              command:
+                - ls
+                - /data
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+          volumeMounts:
+            # HostToContainer is what makes the example survive a plugin restart:
+            # the mount recovery re-mounts on the host and the propagation lets
+            # this container see it without a restart (D-19).
+            - name: data
+              mountPath: /data
+              mountPropagation: HostToContainer
+      # No runAsNonRoot/runAsUser on purpose: it runs as root, because the root
+      # of a GlusterFS volume is normally owned by root:root with mode 755.
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: shared-data

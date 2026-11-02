@@ -1,0 +1,26 @@
+# Static persistent volume backed by an existing GlusterFS volume.
+#
+# The volumeHandle format is gfs:v1:static:<clusterID>:<glusterVolume>[:<subdir>];
+# the clusterID (here "prod") must exist as an entry in the glusterfs-csi-config
+# ConfigMap of the cluster, otherwise the mount fails with NotFound.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: glusterfs-static-example
+spec:
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  volumeMode: Filesystem
+  claimRef:
+    namespace: glusterfs-csi-example
+    name: shared-data
+  csi:
+    driver: glusterfs.csi.io
+    volumeHandle: "gfs:v1:static:prod:shared-vol"
+    volumeAttributes:
+      clusterID: prod
+      volume: shared-vol

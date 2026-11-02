@@ -13,8 +13,23 @@
 **Kubernetes 侧**
 - 所有节点内核支持 FUSE（`/dev/fuse` 存在）。容器内挂载模式下，宿主机无需安装 glusterfs 客户端。
 - K8s 节点到 Gluster 节点的上述端口网络可达。
+- K8s 节点能解析 Gluster 服务器的主机名（DNS 或节点 `/etc/hosts`）：node 插件使用 hostNetwork，容器内的 `/etc/hosts` 来自节点（D-21），FUSE 客户端按 volfile 中的主机名连接 brick。
+- kubelet 根目录为 `/var/lib/kubelet`（k3s、microk8s 等需修改清单中的 hostPath）。
 
 ## 2. 安装
+
+**M1：kustomize（当前可用）**。在 `deploy/kustomize/overlays/` 下复制 `sample` 为自己的 overlay（保持在同级目录，`../../base` 的相对路径才有效），修改 `config.json` 中的 servers，并把镜像 tag 固定为
+`sha-<短 sha>` 或发布版本：
+```bash
+cp -r deploy/kustomize/overlays/sample deploy/kustomize/overlays/mycluster   # 编辑其中的 config.json 与 images.newTag
+kubectl apply -k deploy/kustomize/overlays/mycluster
+kubectl -n glusterfs-csi get pods -o wide            # 每个节点一个 glusterfs-csi-node，3/3 Ready
+kubectl get csinode -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.spec.drivers[*].name}{"\n"}{end}'
+```
+node DaemonSet 使用 `updateStrategy: OnDelete`：升级时先腾空一个节点的业务 Pod，再删除该节点的插件 Pod，逐节点进行。
+静态卷示例见 `deploy/kustomize/examples/static`（修改 PV 的 volumeHandle 后 `kubectl apply -k`）。
+
+**目标形态：Helm（M2 起）**
 ```bash
 helm install glusterfs-csi deploy/helm/glusterfs-csi -n glusterfs-csi --create-namespace \
   --set clusters[0].id=prod \

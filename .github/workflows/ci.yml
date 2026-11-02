@@ -84,6 +84,20 @@ jobs:
           go mod tidy
           git diff --exit-code go.mod go.sum
 
+  manifests:
+    name: Manifests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      # The runner ships kubectl (kustomize) and docker; kubeconform is run
+      # from its pinned image so the schema version is reproducible.
+      - name: Verify manifests
+        env:
+          KUBECONFORM: docker run --rm -i ghcr.io/yannh/kubeconform:v0.8.0
+        run: hack/verify-manifests.sh
+
   build:
     name: Build
     runs-on: ubuntu-latest

@@ -1,0 +1,11 @@
+# Namespace of the node plugin; privileged because the plugin mounts FUSE filesystems.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: glusterfs-csi
+  labels:
+    app.kubernetes.io/name: glusterfs-csi
+    app.kubernetes.io/part-of: glusterfs-csi
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
