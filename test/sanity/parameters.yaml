@@ -1,0 +1,13 @@
+# StorageClass parameters of the csi-sanity run (--csi.testvolumeparameters), in the
+# format of a StorageClass parameters block (D-31).
+#
+# clusterID "sanity" is the entry of config.json; parentVolume "csi-parent" is the
+# single brick volume hack/run-sanity.sh creates in the gluster container.
+#
+# onDelete is "delete" and not "archive" or "retain": every volume csi-sanity deletes
+# then really disappears from the parent volume, so the run can check afterwards that
+# the parent volume is clean again and that no metadata was left behind.
+clusterID: sanity
+provisioningMode: subdir
+parentVolume: csi-parent
+onDelete: delete

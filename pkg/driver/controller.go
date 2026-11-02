@@ -354,13 +354,15 @@ func backendError(ctx context.Context, op string, err error) error {
 
 // CreateVolume provisions a subdirectory of a parent volume (D-22, D-25).
 //
-// The volume is a directory named after the request, its metadata is written
-// before the directory is created, and the parent volume is mounted by the
-// controller and cached (D-24). Capacity is recorded, not enforced: a subdirectory
-// of a shared GlusterFS volume has no size of its own until quota is implemented
-// in M3, so a request with no capacity range is served with capacity 0 ("unknown")
-// and a repeated request with a larger one is refused as AlreadyExists instead of
-// silently promising space that does not exist.
+// The volume is a directory named after the request; when the name is too long to
+// fit into a volume_id (the CSI limit of 128 bytes is shared by the name and the
+// id), the directory is named after the derived name of [volumeid.SubdirName]
+// instead (D-30). Its metadata is written before the directory is created, and the
+// parent volume is mounted by the controller and cached (D-24). Capacity is
+// recorded, not enforced: a subdirectory of a shared GlusterFS volume has no size
+// of its own until quota is implemented in M3, so a request with no capacity range
+// is served with capacity 0 ("unknown") and a repeated request with a larger one is
+// refused as AlreadyExists instead of silently promising space that does not exist.
 //
 // The write order is what makes the RPC idempotent and crash safe: a metadata file
 // without a directory is repaired by the next call, while a directory without a
@@ -422,15 +424,29 @@ func (s *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, status.Errorf(codes.InvalidArgument, "cluster %q is not configured", params.ClusterID)
 	}
 
+	// The directory name is derived before the parent volume is mounted: a name that
+	// cannot be turned into a volume id is a broken request, and a broken request
+	// must not cost a mount.
+	subdir, err := volumeid.SubdirName(params.ClusterID, params.ParentVolume, name)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "cannot derive a directory name for volume %q: %v", name, err)
+	}
+	if subdir != name {
+		// The CO sees the id, not the directory: say why the two differ.
+		klog.InfoS("volume name does not fit into a volume id, using a derived directory name",
+			"name", name, "subdir", subdir)
+	}
+
 	id := volumeid.ID{
 		Mode:      volumeid.ModeSubdir,
 		ClusterID: params.ClusterID,
 		Volume:    params.ParentVolume,
-		Subdir:    name,
+		Subdir:    subdir,
 	}
 	encoded, err := volumeid.Encode(id)
 	if err != nil {
-		// A name that is a valid single name can still make the whole id too long.
+		// Defensive only: SubdirName already chose a name that fits, so the encoded
+		// form cannot be too long any more.
 		return nil, status.Errorf(codes.InvalidArgument, "cannot encode the volume id: %v", err)
 	}
 
@@ -454,13 +470,13 @@ func (s *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, err
 	}
 
-	meta, found, err := readVolumeMeta(root, name)
+	meta, found, err := readVolumeMeta(root, id.Subdir)
 	if err != nil {
 		return nil, backendError(ctx, "read the volume metadata", err)
 	}
 
 	if !found {
-		exists, existsErr := volumeDirExists(root, name)
+		exists, existsErr := volumeDirExists(root, id.Subdir)
 		if existsErr != nil {
 			return nil, backendError(ctx, "look for the volume directory", existsErr)
 		}
@@ -469,21 +485,22 @@ func (s *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 			// it would mean overwriting somebody's data, so it is refused and left
 			// untouched (D-25).
 			return nil, status.Errorf(codes.AlreadyExists,
-				"directory %q exists in parent volume %q but was not created by this driver", name, id.Volume)
+				"directory %q exists in parent volume %q but was not created by this driver", id.Subdir, id.Volume)
 		}
 
 		// Metadata first: a crash in between leaves a volume that the next call
 		// completes, whereas the reverse order would leave a directory DeleteVolume
 		// refuses to touch.
 		meta = volumeMeta{Version: metaVersion, CapacityBytes: capacity, OnDelete: params.OnDelete}
-		if wErr := writeVolumeMeta(root, name, meta); wErr != nil {
+		if wErr := writeVolumeMeta(root, id.Subdir, meta); wErr != nil {
 			return nil, backendError(ctx, "write the volume metadata", wErr)
 		}
-		if dErr := ensureVolumeDir(root, name); dErr != nil {
+		if dErr := ensureVolumeDir(root, id.Subdir); dErr != nil {
 			return nil, backendError(ctx, "create the volume directory", dErr)
 		}
 		klog.InfoS("created volume", "volumeID", encoded, "parentVolume", id.Volume,
-			"clusterID", id.ClusterID, "capacityBytes", capacity, "onDelete", string(meta.OnDelete))
+			"clusterID", id.ClusterID, "name", name, "subdir", id.Subdir,
+			"capacityBytes", capacity, "onDelete", string(meta.OnDelete))
 		return createVolumeResponse(encoded, id, meta), nil
 	}
 
@@ -495,16 +512,16 @@ func (s *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 		// administrator sees which part of the StorageClass or of the PVC differs.
 		return nil, status.Errorf(codes.AlreadyExists,
 			"volume %q already exists with onDelete %q and capacity %d, which does not satisfy the request: %s",
-			name, string(meta.OnDelete), meta.CapacityBytes, reason)
+			id.Subdir, string(meta.OnDelete), meta.CapacityBytes, reason)
 	}
 	// The Chmod repairs the permission of a volume created under a strict umask,
 	// and the directory itself repairs the crash between the metadata write and the
 	// Mkdir above.
-	if dErr := ensureVolumeDir(root, name); dErr != nil {
+	if dErr := ensureVolumeDir(root, id.Subdir); dErr != nil {
 		return nil, backendError(ctx, "create the volume directory", dErr)
 	}
 	klog.V(4).InfoS("volume already exists, returning it", "volumeID", encoded,
-		"parentVolume", id.Volume, "capacityBytes", meta.CapacityBytes)
+		"parentVolume", id.Volume, "name", name, "subdir", id.Subdir, "capacityBytes", meta.CapacityBytes)
 	return createVolumeResponse(encoded, id, meta), nil
 }
 

@@ -5,6 +5,7 @@
 #   make test    - run unit tests with the race detector
 #   make lint    - run golangci-lint
 #   make image   - build a multi-arch image (amd64 + arm64, no push)
+#   make sanity  - run csi-sanity against a local GlusterFS container
 #   make clean   - remove build artifacts
 
 BINARY     ?= glusterfs-csi
@@ -29,7 +30,7 @@ GOFLAGS   ?=
 GOLANGCI  ?= golangci-lint
 DOCKER    ?= docker
 
-.PHONY: all build test lint vet fmt image verify-manifests clean help
+.PHONY: all build test lint vet fmt image verify-manifests sanity clean help
 
 all: build
 
@@ -64,6 +65,10 @@ image:
 ## verify-manifests: render the kustomize manifests and validate them with kubeconform
 verify-manifests:
 	hack/verify-manifests.sh
+
+## sanity: run csi-sanity against a local GlusterFS container (needs docker with privileged containers)
+sanity:
+	hack/run-sanity.sh
 
 ## clean: remove build artifacts
 clean:

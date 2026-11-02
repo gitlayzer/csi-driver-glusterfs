@@ -3,6 +3,7 @@ package driver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -1611,8 +1612,9 @@ func wantVolumeDirMode(t *testing.T, dir string) {
 }
 
 func TestCreateVolumeValidation(t *testing.T) {
-	longName := strings.Repeat("a", volumeid.MaxLength)
-
+	// A name of the full MaxLength is not a validation error any more: the directory
+	// name is derived so that the volume id fits (D-30), which
+	// TestCreateVolumeDerivesSubdirNameForLongName covers.
 	tests := []struct {
 		name           string
 		req            *csi.CreateVolumeRequest
@@ -1642,12 +1644,6 @@ func TestCreateVolumeValidation(t *testing.T) {
 			req:            subdirCreateRequest(".hidden"),
 			wantCode:       codes.InvalidArgument,
 			wantErrMessage: "reserved",
-		},
-		{
-			name:           "name that makes the volume id too long",
-			req:            subdirCreateRequest(longName),
-			wantCode:       codes.InvalidArgument,
-			wantErrMessage: "cannot encode the volume id",
 		},
 		{
 			name: "no capabilities",
@@ -2053,27 +2049,42 @@ func TestCreateVolumeCompatibility(t *testing.T) {
 }
 
 func TestCreateVolumeKeepsForeignDirectory(t *testing.T) {
-	service, _ := newTestController(t)
-	dir := createVolumeDir(t, parentVolumePath(t, service, "c1", "vol"), "pvc-1", 0o755)
-	writeTestFile(t, dir, "data.txt", "somebody else's data")
-
-	_, err := service.CreateVolume(context.Background(), subdirCreateRequest("pvc-1"))
-	wantCode(t, err, codes.AlreadyExists)
-	if msg := status.Convert(err).Message(); !strings.Contains(msg, "was not created by this driver") {
-		t.Fatalf("CreateVolume() message = %q, want it to say the directory is not ours", msg)
+	tests := []struct {
+		name       string
+		volumeName string
+		// subdir is the directory the request maps to: the name itself, or the
+		// derived name of a name that does not fit into a volume id (D-30).
+		subdir string
+	}{
+		{name: "short name", volumeName: "pvc-1", subdir: "pvc-1"},
+		{name: "derived name", volumeName: maxLenVolumeName, subdir: maxLenDerivedSubdir},
 	}
 
-	// Neither the directory nor its content may change, and no metadata is written:
-	// the driver does not adopt a directory it did not create (D-25).
-	content, readErr := os.ReadFile(filepath.Join(dir, "data.txt"))
-	if readErr != nil || string(content) != "somebody else's data" {
-		t.Fatalf("directory content = %q (%v), want it untouched", content, readErr)
-	}
-	if entries, readErr := os.ReadDir(dir); readErr != nil || len(entries) != 1 {
-		t.Fatalf("directory entries = %v (%v), want only data.txt", namesOf(entries), readErr)
-	}
-	if _, found := volumeMetaOf(t, service, "pvc-1"); found {
-		t.Fatal("metadata was written for a directory this driver did not create")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			service, _ := newTestController(t)
+			dir := createVolumeDir(t, parentVolumePath(t, service, "c1", "vol"), tc.subdir, 0o755)
+			writeTestFile(t, dir, "data.txt", "somebody else's data")
+
+			_, err := service.CreateVolume(context.Background(), subdirCreateRequest(tc.volumeName))
+			wantCode(t, err, codes.AlreadyExists)
+			if msg := status.Convert(err).Message(); !strings.Contains(msg, "was not created by this driver") {
+				t.Fatalf("CreateVolume() message = %q, want it to say the directory is not ours", msg)
+			}
+
+			// Neither the directory nor its content may change, and no metadata is
+			// written: the driver does not adopt a directory it did not create (D-25).
+			content, readErr := os.ReadFile(filepath.Join(dir, "data.txt"))
+			if readErr != nil || string(content) != "somebody else's data" {
+				t.Fatalf("directory content = %q (%v), want it untouched", content, readErr)
+			}
+			if entries, readErr := os.ReadDir(dir); readErr != nil || len(entries) != 1 {
+				t.Fatalf("directory entries = %v (%v), want only data.txt", namesOf(entries), readErr)
+			}
+			if _, found := volumeMetaOf(t, service, tc.subdir); found {
+				t.Fatal("metadata was written for a directory this driver did not create")
+			}
+		})
 	}
 }
 
@@ -2739,5 +2750,288 @@ func TestDeleteVolumeMetadataRemovalFailure(t *testing.T) {
 	}
 	if _, statErr := os.Lstat(filepath.Join(parent, filepath.FromSlash(metaFileName("pvc-1")))); statErr != nil {
 		t.Fatalf("the metadata is gone (%v), want it kept", statErr)
+	}
+}
+
+// maxLenVolumeName is the 128 byte volume name csi-sanity uses for its "should not
+// fail when creating volume with maximum-length name" spec, and the name whose
+// directory name CreateVolume has to derive (D-30). The derived name below was
+// computed outside the code under test with
+//
+//	printf '%s' "<name>" | sha256sum
+const (
+	maxLenVolumeName = "sanity-controller-create-maxlen-0123ABCD-4567EF01" +
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	maxLenDerivedSubdir       = "sanity-controller-create-maxlen-0123ABCD-4567EF01aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-c9c17b41bf88fcf7"
+	maxLenDerivedSubdirVolume = "gfs:v1:subdir:c1:vol:" + maxLenDerivedSubdir
+)
+
+// parentEntries returns the names of the entries of the parent volume of a test,
+// sorted, so that a test can assert what CreateVolume and DeleteVolume left there.
+func parentEntries(t *testing.T, service *controllerService) []string {
+	t.Helper()
+
+	entries, err := os.ReadDir(parentVolumePath(t, service, "c1", "vol"))
+	if err != nil {
+		t.Fatalf("ReadDir(parent volume) = %v, want nil", err)
+	}
+	names := namesOf(entries)
+	slices.Sort(names)
+	return names
+}
+
+func TestCreateVolumeDerivesSubdirNameForLongName(t *testing.T) {
+	if got := len(maxLenVolumeName); got != volumeid.MaxLength {
+		t.Fatalf("test setup: the name is %d bytes long, want %d", got, volumeid.MaxLength)
+	}
+
+	service, fake := newTestControllerMounting(t)
+	req := withCapacity(subdirCreateRequest(maxLenVolumeName), 1<<30, 2<<30)
+
+	resp, err := service.CreateVolume(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CreateVolume() = %v, want nil", err)
+	}
+
+	volume := resp.GetVolume()
+	if got := volume.GetVolumeId(); got != maxLenDerivedSubdirVolume {
+		t.Fatalf("VolumeId = %q, want %q", got, maxLenDerivedSubdirVolume)
+	}
+	// The id is at most 128 bytes, which is what makes it usable as a CSI string.
+	if got := len(volume.GetVolumeId()); got > volumeid.MaxLength {
+		t.Fatalf("len(VolumeId) = %d, want at most %d", got, volumeid.MaxLength)
+	}
+	// The volume context reports the derived name, not the request name: the node
+	// service mounts exactly what the controller created.
+	if got := volume.GetVolumeContext()[attrSubdir]; got != maxLenDerivedSubdir {
+		t.Fatalf("volume context %s = %q, want %q", attrSubdir, got, maxLenDerivedSubdir)
+	}
+	if got := volume.GetVolumeContext()[attrVolume]; got != "vol" {
+		t.Fatalf("volume context %s = %q, want %q", attrVolume, got, "vol")
+	}
+
+	// The parent volume was mounted once, after the name was derived.
+	if got := fake.mountCount(); got != 1 {
+		t.Fatalf("MountGlusterfs calls = %d, want 1", got)
+	}
+
+	// The directory carries the derived name and the permission of D-27 ...
+	dir := volumeDirOf(t, service, maxLenDerivedSubdir)
+	wantVolumeDirMode(t, dir)
+
+	// ... its metadata is the file of the derived name ...
+	meta, found := volumeMetaOf(t, service, maxLenDerivedSubdir)
+	if !found {
+		t.Fatal("the metadata was not written under the derived name")
+	}
+	if wantMeta := (volumeMeta{Version: metaVersion, CapacityBytes: 1 << 30, OnDelete: deletePolicyDelete}); meta != wantMeta {
+		t.Fatalf("metadata = %+v, want %+v", meta, wantMeta)
+	}
+
+	// ... and nothing was created under the full volume name, which could not be
+	// encoded in a volume id anyway.
+	if _, statErr := os.Lstat(volumeDirOf(t, service, maxLenVolumeName)); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("a directory named after the full volume name exists (%v), want none", statErr)
+	}
+	if _, found := volumeMetaOf(t, service, maxLenVolumeName); found {
+		t.Fatal("metadata was written for the full volume name")
+	}
+	if got, want := parentEntries(t, service), []string{metaDirName, maxLenDerivedSubdir}; !slices.Equal(got, want) {
+		t.Fatalf("parent volume entries = %v, want %v", got, want)
+	}
+}
+
+func TestCreateVolumeLongNameIsIdempotent(t *testing.T) {
+	service, _ := newTestControllerMounting(t)
+	ctx := context.Background()
+
+	first, err := service.CreateVolume(ctx, withCapacity(subdirCreateRequest(maxLenVolumeName), 1<<30, 2<<30))
+	if err != nil {
+		t.Fatalf("CreateVolume() = %v, want nil", err)
+	}
+	second, err := service.CreateVolume(ctx, withCapacity(subdirCreateRequest(maxLenVolumeName), 1<<30, 2<<30))
+	if err != nil {
+		t.Fatalf("the repeated CreateVolume() = %v, want nil", err)
+	}
+	if !proto.Equal(first.GetVolume(), second.GetVolume()) {
+		t.Fatalf("the repeated response = %v, want %v", second.GetVolume(), first.GetVolume())
+	}
+	// A second directory would mean the two calls derived different names.
+	if got, want := parentEntries(t, service), []string{metaDirName, maxLenDerivedSubdir}; !slices.Equal(got, want) {
+		t.Fatalf("parent volume entries = %v, want %v", got, want)
+	}
+
+	// A different onDelete describes another volume, and the mismatch is detected on
+	// the metadata written under the derived name: the lookup cannot be using the
+	// full volume name, which has no metadata file.
+	_, err = service.CreateVolume(ctx, withOnDelete(subdirCreateRequest(maxLenVolumeName), deletePolicyArchive))
+	wantCode(t, err, codes.AlreadyExists)
+	message := status.Convert(err).Message()
+	if !strings.Contains(message, maxLenDerivedSubdir) {
+		t.Fatalf("CreateVolume() message = %q, want it to name the derived directory %q", message, maxLenDerivedSubdir)
+	}
+	if !strings.Contains(message, `onDelete "archive" was requested, the volume uses "delete"`) {
+		t.Fatalf("CreateVolume() message = %q, want the delete policy mismatch", message)
+	}
+}
+
+func TestDeleteVolumeAfterLongNameCreate(t *testing.T) {
+	service, _ := newTestControllerMounting(t)
+	ctx := context.Background()
+
+	resp, err := service.CreateVolume(ctx, subdirCreateRequest(maxLenVolumeName))
+	if err != nil {
+		t.Fatalf("CreateVolume() = %v, want nil", err)
+	}
+	volumeID := resp.GetVolume().GetVolumeId()
+	if volumeID != maxLenDerivedSubdirVolume {
+		t.Fatalf("VolumeId = %q, want %q", volumeID, maxLenDerivedSubdirVolume)
+	}
+
+	// DeleteVolume only receives the volume id and has to remove the derived
+	// directory and its metadata from it.
+	if _, err := service.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: volumeID}); err != nil {
+		t.Fatalf("DeleteVolume() = %v, want nil", err)
+	}
+	if _, statErr := os.Lstat(volumeDirOf(t, service, maxLenDerivedSubdir)); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("the derived directory still exists (%v), want it removed", statErr)
+	}
+	if _, found := volumeMetaOf(t, service, maxLenDerivedSubdir); found {
+		t.Fatal("the metadata of the derived name still exists")
+	}
+	if got, want := parentEntries(t, service), []string{metaDirName}; !slices.Equal(got, want) {
+		t.Fatalf("parent volume entries = %v, want %v", got, want)
+	}
+
+	// A repeated DeleteVolume succeeds: the volume id is still decodable, and both
+	// the metadata and the directory are gone.
+	if _, err := service.DeleteVolume(ctx, &csi.DeleteVolumeRequest{VolumeId: volumeID}); err != nil {
+		t.Fatalf("the repeated DeleteVolume() = %v, want nil", err)
+	}
+}
+
+func TestCreateVolumeSeparatesLongNames(t *testing.T) {
+	// The two names share their first 120 bytes; only the hash suffix of the derived
+	// name tells their directories apart.
+	prefix := "sanity-controller-create-maxlen-0123ABCD-4567EF01" + strings.Repeat("a", 71)
+	first, second := prefix+"zzzzzzzz", prefix+"yyyyyyyy"
+	if len(first) != volumeid.MaxLength || len(second) != volumeid.MaxLength {
+		t.Fatalf("test setup: the names are %d and %d bytes long, want %d", len(first), len(second), volumeid.MaxLength)
+	}
+
+	service, _ := newTestControllerMounting(t)
+	ctx := context.Background()
+
+	firstResp, err := service.CreateVolume(ctx, subdirCreateRequest(first))
+	if err != nil {
+		t.Fatalf("CreateVolume(%q) = %v, want nil", first, err)
+	}
+	secondResp, err := service.CreateVolume(ctx, subdirCreateRequest(second))
+	if err != nil {
+		t.Fatalf("CreateVolume(%q) = %v, want nil", second, err)
+	}
+
+	firstID, secondID := firstResp.GetVolume().GetVolumeId(), secondResp.GetVolume().GetVolumeId()
+	if firstID == secondID {
+		t.Fatalf("both names got the volume id %q, want two different ids", firstID)
+	}
+	firstDir, secondDir := firstResp.GetVolume().GetVolumeContext()[attrSubdir],
+		secondResp.GetVolume().GetVolumeContext()[attrSubdir]
+	if firstDir == secondDir {
+		t.Fatalf("both names got the directory %q, want two different directories", firstDir)
+	}
+
+	wantEntries := []string{metaDirName, firstDir, secondDir}
+	slices.Sort(wantEntries)
+	if got := parentEntries(t, service); !slices.Equal(got, wantEntries) {
+		t.Fatalf("parent volume entries = %v, want %v", got, wantEntries)
+	}
+	for _, dir := range []string{firstDir, secondDir} {
+		wantVolumeDirMode(t, volumeDirOf(t, service, dir))
+		if _, found := volumeMetaOf(t, service, dir); !found {
+			t.Fatalf("the metadata of %q was not written", dir)
+		}
+	}
+}
+
+// TestCreateVolumeShortNameKeepsName checks the other branch of the derivation: a
+// Kubernetes volume name fits into a volume id and is used as the directory name
+// unchanged. TestCreateVolumeCreatesDirectoryAndMetadata asserts the same volume id
+// and directory for "pvc-1"; this test states the rule explicitly for the length of
+// a real PVC name.
+func TestCreateVolumeShortNameKeepsName(t *testing.T) {
+	const name = "pvc-11111111-2222-3333-4444-555555555555"
+
+	service, _ := newTestControllerMounting(t)
+	resp, err := service.CreateVolume(context.Background(), subdirCreateRequest(name))
+	if err != nil {
+		t.Fatalf("CreateVolume() = %v, want nil", err)
+	}
+	wantID := "gfs:v1:subdir:c1:vol:" + name
+	if got := resp.GetVolume().GetVolumeId(); got != wantID {
+		t.Fatalf("VolumeId = %q, want %q", got, wantID)
+	}
+	if got := resp.GetVolume().GetVolumeContext()[attrSubdir]; got != name {
+		t.Fatalf("volume context %s = %q, want %q", attrSubdir, got, name)
+	}
+	wantVolumeDirMode(t, volumeDirOf(t, service, name))
+	if _, found := volumeMetaOf(t, service, name); !found {
+		t.Fatal("the metadata was not written under the volume name")
+	}
+}
+
+// TestCreateVolumeLongClusterAndVolumeRefuseName checks the configuration in which
+// even a derived directory name cannot fit: the cluster id and the parent volume
+// name leave fewer than SubdirHashLength+2 bytes of the volume id. The request has
+// to fail before anything is mounted or created.
+func TestCreateVolumeLongClusterAndVolumeRefuseName(t *testing.T) {
+	// "gfs:v1:subdir:" is 14 bytes and the two colons around the names are 2 more,
+	// so two 47 byte names leave 18 bytes, and one more byte leaves 17.
+	clusterID := strings.Repeat("c", 47)
+	parentVolume := strings.Repeat("v", 48)
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	document := fmt.Sprintf(`[{"clusterID":%q,"servers":["gluster-server"]}]`, clusterID)
+	if err := os.WriteFile(configPath, []byte(document), 0o600); err != nil {
+		t.Fatalf("WriteFile(config) = %v, want nil", err)
+	}
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatalf("NewStore() = %v, want nil", err)
+	}
+
+	d, err := New(controllerOptions(t))
+	if err != nil {
+		t.Fatalf("New() = %v, want nil", err)
+	}
+	d.config = store
+	fake := &fakeMounter{mountState: mounter.MountStateNotMounted, trackState: true}
+	fake.onCreate = func(target string) error { return os.MkdirAll(target, 0o750) }
+	d.controller.parents = newParentMounts(fake, t.TempDir())
+	service := d.controller
+
+	// A name of 19 bytes is one byte more than the budget of 18.
+	req := subdirCreateRequest(strings.Repeat("d", 19))
+	req.Parameters = map[string]string{paramClusterID: clusterID, paramParentVolume: parentVolume}
+
+	resp, err := service.CreateVolume(context.Background(), req)
+	wantCode(t, err, codes.InvalidArgument)
+	if resp != nil {
+		t.Fatalf("CreateVolume() = %+v with an error, want nil", resp)
+	}
+	message := status.Convert(err).Message()
+	if !strings.Contains(message, "cannot derive a directory name") {
+		t.Fatalf("CreateVolume() message = %q, want it to name the derivation", message)
+	}
+	if !strings.Contains(message, "at least 18") {
+		t.Fatalf("CreateVolume() message = %q, want it to report the 18 bytes that are needed", message)
+	}
+
+	// Nothing was mounted and the parent volume stays empty.
+	if got := fake.mountStateCount() + fake.mountCount(); got != 0 {
+		t.Fatalf("mounter calls = %d, want none for a rejected request", got)
+	}
+	parent := parentVolumePath(t, service, clusterID, parentVolume)
+	if _, statErr := os.Lstat(parent); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("the parent mount point exists (%v), want none", statErr)
 	}
 }

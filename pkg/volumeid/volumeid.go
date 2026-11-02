@@ -25,6 +25,8 @@
 package volumeid
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"regexp"
@@ -52,6 +54,10 @@ const (
 	// default limit for string fields is 128 bytes).
 	MaxLength = 128
 )
+
+// SubdirHashLength is the number of hexadecimal digits of the SHA-256 of a volume
+// name that a derived subdirectory name ends with (D-30).
+const SubdirHashLength = 16
 
 // ErrInvalid is the sentinel wrapped by every validation and parsing error
 // returned by this package.
@@ -109,6 +115,53 @@ func ValidateName(field, value string) error {
 		return invalidf("invalid %s %q: must match %s", field, value, nameRE.String())
 	}
 	return nil
+}
+
+// SubdirName returns the subdirectory name a subdir volume called name gets in
+// volume of clusterID: the name itself when the encoded volume id fits into
+// MaxLength, otherwise a derived name (D-30).
+//
+// A CSI CreateVolumeRequest may carry a name of up to 128 bytes, which is exactly
+// the limit of a volume_id, so a name that fills the limit cannot be embedded in
+// a volume_id verbatim. Such a name is replaced by its first bytes, a "-" and the
+// first [SubdirHashLength] hexadecimal digits of its SHA-256, which makes the
+// result short enough that the encoded volume id is at most [MaxLength] bytes and
+// usually fills it exactly.
+//
+// The derived name depends on the volume name only, so repeating the call yields
+// the same name and CreateVolume stays idempotent. It is used by CreateVolume
+// only: every other RPC reads the subdirectory name out of the volume_id. Names
+// longer than the budget mostly share the same prefix, but they differ in the
+// rest, and finding two names with the same 64 bit hash prefix takes about 2^32
+// attempts, which is out of reach of a volume name a CO picks by accident.
+func SubdirName(clusterID, volume, name string) (string, error) {
+	if err := ValidateName("cluster id", clusterID); err != nil {
+		return "", err
+	}
+	if err := ValidateName("volume", volume); err != nil {
+		return "", err
+	}
+	if err := ValidateName("name", name); err != nil {
+		return "", err
+	}
+
+	// budget is how many bytes of the volume_id are left for the subdirectory:
+	// the prefix, the version, the mode, the cluster id and the volume, separated
+	// by the colons of the canonical form (docs/architecture.md §5.1).
+	budget := MaxLength - (len(Prefix) + len(Version) + len(ModeSubdir) + len(clusterID) + len(volume) + 5)
+	if len(name) <= budget {
+		return name, nil
+	}
+	if budget < SubdirHashLength+2 {
+		// One byte of the name at least, one "-" and the hash; anything shorter
+		// would make the derived name collide with a far too simple scheme.
+		return "", invalidf("invalid volume id: cluster id %q and volume %q leave %d bytes for the subdirectory, at least %d are needed",
+			clusterID, volume, budget, SubdirHashLength+2)
+	}
+
+	sum := sha256.Sum256([]byte(name))
+	return name[:budget-SubdirHashLength-1] + "-" +
+		hex.EncodeToString(sum[:])[:SubdirHashLength], nil
 }
 
 // validateMode rejects unknown modes, including the empty mode and modes that

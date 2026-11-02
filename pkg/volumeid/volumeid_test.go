@@ -479,6 +479,294 @@ func TestIDValidate(t *testing.T) {
 	}
 }
 
+// subdirBudget is how many bytes of a volume_id a subdirectory name may take. It
+// is computed from the constants rather than from the implementation.
+func subdirBudget(clusterID, volume string) int {
+	return MaxLength - (len(Prefix) + len(Version) + len(string(ModeSubdir)) + len(clusterID) + len(volume) + 5)
+}
+
+// maxLenVolumeName is the 128 byte volume name csi-sanity uses for its "should not
+// fail when creating volume with maximum-length name" spec: a fixed prefix followed
+// by padding.
+const maxLenVolumeName = "sanity-controller-create-maxlen-0123ABCD-4567EF01" +
+	"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+// TestSubdirName covers the derivation of a subdirectory name (D-30).
+//
+// Every expected derived name is hard-coded. They were computed outside the code
+// under test with
+//
+//	printf '%s' "<name>" | sha256sum
+//
+// so a wrong hash, a wrong truncation length or a wrong budget makes the test fail
+// instead of being hidden by reusing the hash of the implementation.
+func TestSubdirName(t *testing.T) {
+	// The budget of "dev"/"csi-parent" is 99, so a 128 byte name keeps its first 82
+	// bytes; the budget of "c1"/"vol" is 107, so it keeps its first 90.
+	const (
+		sanityHash         = "c9c17b41bf88fcf7"
+		sanityDerived99    = "sanity-controller-create-maxlen-0123ABCD-4567EF01aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-" + sanityHash
+		sanityDerived107   = "sanity-controller-create-maxlen-0123ABCD-4567EF01aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-" + sanityHash
+		aHundredN          = "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-4e9d823140bd9805"
+		clusterFortySeven  = "ccccccccccccccccccccccccccccccccccccccccccccccc"
+		volumeFortySeven   = "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
+		volumeFortyEight   = "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"
+		smallestBudgetName = "d-af5bb51c27f201e5"
+	)
+
+	tests := []struct {
+		name       string
+		clusterID  string
+		volume     string
+		volumeName string
+		// want is the expected derived name; an empty want with wantErr false means
+		// the name is returned unchanged.
+		want    string
+		wantErr bool
+	}{
+		{
+			name:       "a Kubernetes volume name is used as it is",
+			clusterID:  "dev",
+			volume:     "csi-parent",
+			volumeName: "pvc-11111111-2222-3333-4444-555555555555",
+			want:       "pvc-11111111-2222-3333-4444-555555555555",
+		},
+		{
+			name:       "a name of exactly the budget is used as it is",
+			clusterID:  "dev",
+			volume:     "csi-parent",
+			volumeName: strings.Repeat("n", subdirBudget("dev", "csi-parent")),
+			want:       strings.Repeat("n", subdirBudget("dev", "csi-parent")),
+		},
+		{
+			name:       "one byte over the budget is derived",
+			clusterID:  "dev",
+			volume:     "csi-parent",
+			volumeName: strings.Repeat("n", subdirBudget("dev", "csi-parent")+1),
+			want:       aHundredN,
+		},
+		{
+			name:       "the 128 byte csi-sanity name",
+			clusterID:  "dev",
+			volume:     "csi-parent",
+			volumeName: maxLenVolumeName,
+			want:       sanityDerived99,
+		},
+		{
+			name:       "the 128 byte csi-sanity name in a shorter id",
+			clusterID:  "c1",
+			volume:     "vol",
+			volumeName: maxLenVolumeName,
+			want:       sanityDerived107,
+		},
+		{
+			name:       "the smallest budget that still works",
+			clusterID:  clusterFortySeven,
+			volume:     volumeFortySeven,
+			volumeName: strings.Repeat("d", 19),
+			want:       smallestBudgetName,
+		},
+		{
+			name:       "a budget of 17 bytes is too small",
+			clusterID:  clusterFortySeven,
+			volume:     volumeFortyEight,
+			volumeName: strings.Repeat("d", 19),
+			wantErr:    true,
+		},
+		{
+			name:       "a negative budget is too small",
+			clusterID:  strings.Repeat("c", MaxLength),
+			volume:     strings.Repeat("v", MaxLength),
+			volumeName: "pvc-1",
+			wantErr:    true,
+		},
+		{
+			name:       "empty cluster id",
+			clusterID:  "",
+			volume:     "vol",
+			volumeName: "pvc-1",
+			wantErr:    true,
+		},
+		{
+			name:       "invalid cluster id",
+			clusterID:  "a/b",
+			volume:     "vol",
+			volumeName: "pvc-1",
+			wantErr:    true,
+		},
+		{
+			name:       "empty volume",
+			clusterID:  "c1",
+			volume:     "",
+			volumeName: "pvc-1",
+			wantErr:    true,
+		},
+		{
+			name:       "relative volume",
+			clusterID:  "c1",
+			volume:     "..",
+			volumeName: "pvc-1",
+			wantErr:    true,
+		},
+		{
+			name:       "empty name",
+			clusterID:  "c1",
+			volume:     "vol",
+			volumeName: "",
+			wantErr:    true,
+		},
+		{
+			name:       "a name that is not a valid single name",
+			clusterID:  "c1",
+			volume:     "vol",
+			volumeName: "--help",
+			wantErr:    true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := SubdirName(tc.clusterID, tc.volume, tc.volumeName)
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("SubdirName() = %q, nil, want an error", got)
+				}
+				if !errors.Is(err, ErrInvalid) {
+					t.Fatalf("SubdirName() error = %v, want errors.Is(err, ErrInvalid)", err)
+				}
+				if got != "" {
+					t.Fatalf("SubdirName() returned %q together with an error", got)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("SubdirName() = %v, want nil", err)
+			}
+			if got != tc.want {
+				t.Fatalf("SubdirName(%q, %q, %q) = %q, want %q",
+					tc.clusterID, tc.volume, tc.volumeName, got, tc.want)
+			}
+
+			// Every result fits into a volume id, which is the whole point of the
+			// derivation, and the id is never longer than MaxLength.
+			encoded, encErr := Encode(ID{
+				Mode:      ModeSubdir,
+				ClusterID: tc.clusterID,
+				Volume:    tc.volume,
+				Subdir:    got,
+			})
+			if encErr != nil {
+				t.Fatalf("Encode() = %v, want nil for the derived name %q", encErr, got)
+			}
+			if len(encoded) > MaxLength {
+				t.Fatalf("len(Encode()) = %d, want at most %d", len(encoded), MaxLength)
+			}
+		})
+	}
+}
+
+// TestSubdirNameDerivation checks the shape of a derived name: its length is exactly
+// the budget, it ends with "-" and 16 lowercase hexadecimal digits, and the encoded
+// volume id fills MaxLength exactly.
+func TestSubdirNameDerivation(t *testing.T) {
+	clusterID, volume := "dev", "csi-parent"
+	budget := subdirBudget(clusterID, volume)
+
+	derived, err := SubdirName(clusterID, volume, maxLenVolumeName)
+	if err != nil {
+		t.Fatalf("SubdirName() = %v, want nil", err)
+	}
+	if len(derived) != budget {
+		t.Fatalf("len(derived) = %d, want the budget %d", len(derived), budget)
+	}
+	if !strings.HasSuffix(derived, "-c9c17b41bf88fcf7") {
+		t.Fatalf("derived name %q must end with %q and the 16 hex digits of the hash",
+			derived, "-c9c17b41bf88fcf7")
+	}
+	suffix := derived[len(derived)-SubdirHashLength:]
+	for _, r := range suffix {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			t.Fatalf("hash suffix %q must be lowercase hexadecimal", suffix)
+		}
+	}
+
+	encoded, err := Encode(ID{Mode: ModeSubdir, ClusterID: clusterID, Volume: volume, Subdir: derived})
+	if err != nil {
+		t.Fatalf("Encode() = %v, want nil", err)
+	}
+	if len(encoded) != MaxLength {
+		t.Fatalf("len(Encode()) = %d, want exactly %d", len(encoded), MaxLength)
+	}
+	if encoded != "gfs:v1:subdir:dev:csi-parent:"+derived {
+		t.Fatalf("Encode() = %q, want the derived name as the subdir segment", encoded)
+	}
+}
+
+// TestSubdirNameIsIdempotent checks that the derivation depends on the name only, so
+// that a repeated CreateVolume addresses the same directory (D-30).
+func TestSubdirNameIsIdempotent(t *testing.T) {
+	first, err := SubdirName("dev", "csi-parent", maxLenVolumeName)
+	if err != nil {
+		t.Fatalf("SubdirName() = %v, want nil", err)
+	}
+	for i := 0; i < 5; i++ {
+		again, againErr := SubdirName("dev", "csi-parent", maxLenVolumeName)
+		if againErr != nil {
+			t.Fatalf("SubdirName() = %v, want nil", againErr)
+		}
+		if again != first {
+			t.Fatalf("the %d. call = %q, want the same name as %q", i+2, again, first)
+		}
+	}
+}
+
+// TestSubdirNameSeparatesLongNames checks that two long names that share their first
+// 120 bytes do not end up in the same directory: the hash suffix is what tells them
+// apart, the truncated prefix alone would not.
+func TestSubdirNameSeparatesLongNames(t *testing.T) {
+	prefix := strings.Repeat("y", 120)
+	names := []string{prefix + "aaaaaaaa", prefix + "bbbbbbbb", prefix + "cccccccc"}
+
+	seen := make(map[string]string, len(names))
+	wantSuffixes := []string{"-e7a29c723b54a5f7", "-74bf9855a36e3a51", "-"}
+	for i, name := range names {
+		derived, err := SubdirName("dev", "csi-parent", name)
+		if err != nil {
+			t.Fatalf("SubdirName(%q) = %v, want nil", name, err)
+		}
+		if other, ok := seen[derived]; ok {
+			t.Fatalf("%q and %q both derive %q", other, name, derived)
+		}
+		seen[derived] = name
+		if i < 2 && !strings.HasSuffix(derived, wantSuffixes[i]) {
+			t.Fatalf("SubdirName(%q) = %q, want it to end with %q", name, derived, wantSuffixes[i])
+		}
+		if !strings.HasPrefix(derived, prefix[:len(derived)-SubdirHashLength-1]) {
+			t.Fatalf("SubdirName(%q) = %q, want it to start with the prefix of the name", name, derived)
+		}
+	}
+}
+
+// TestSubdirNameErrorMessages checks that a budget that is too small is reported with
+// both fields and the numbers an administrator needs to fix the cluster or parent
+// volume name.
+func TestSubdirNameErrorMessages(t *testing.T) {
+	clusterID, volume := strings.Repeat("c", 47), strings.Repeat("v", 48)
+
+	_, err := SubdirName(clusterID, volume, strings.Repeat("d", 18))
+	if err == nil {
+		t.Fatal("SubdirName() = nil, want an error for a budget of 17 bytes")
+	}
+	msg := err.Error()
+	for _, part := range []string{"invalid volume id", clusterID, volume, "17", "18"} {
+		if !strings.Contains(msg, part) {
+			t.Fatalf("error message %q must contain %q", msg, part)
+		}
+	}
+}
+
 func FuzzDecode(f *testing.F) {
 	for _, tc := range encodeCases {
 		f.Add(tc.want)

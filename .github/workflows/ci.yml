@@ -117,6 +117,34 @@ jobs:
       - name: Report binary version
         run: ./bin/glusterfs-csi --version
 
+  sanity:
+    name: CSI sanity
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      # The driver serves the volumes over FUSE, so the host has to provide
+      # /dev/fuse and the fuse module before any privileged container uses it.
+      - name: Load the FUSE module
+        run: sudo modprobe fuse && ls -l /dev/fuse
+
+      # Builds the published image, the gluster server and the csi-sanity runner,
+      # then runs the whole suite against them (hack/run-sanity.sh).
+      - name: Run csi-sanity
+        run: make sanity
+
+      # The JUnit report, the driver log and the gluster logs are collected even
+      # when the suite failed; they are what a failure is diagnosed from.
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: csi-sanity
+          path: _output/sanity/
+          if-no-files-found: ignore
+
   dco:
     name: DCO
     if: github.event_name == 'pull_request'

@@ -1,0 +1,8 @@
+[
+  {
+    "clusterID": "sanity",
+    "servers": [
+      "gluster-server"
+    ]
+  }
+]

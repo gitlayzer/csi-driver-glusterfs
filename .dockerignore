@@ -1,6 +1,7 @@
 # Build artifacts
 bin/
 dist/
+_output/
 
 # Test and coverage output
 *.test
