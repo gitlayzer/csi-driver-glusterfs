@@ -1,0 +1,11 @@
+# Dynamic provisioning example: a StorageClass, its claim and three writers that share the provisioned volume.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: glusterfs-csi-dynamic-example
+
+resources:
+  - namespace.yaml
+  - storageclass.yaml
+  - pvc.yaml
+  - deployment.yaml

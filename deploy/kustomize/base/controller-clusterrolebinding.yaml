@@ -1,0 +1,19 @@
+# Binds the provisioner ClusterRole to the controller ServiceAccount.
+#
+# The namespace of the subject is spelled out explicitly so the manifest does not
+# depend on a kustomize namespace transformer having run.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: glusterfs-csi-provisioner
+  labels:
+    app.kubernetes.io/name: glusterfs-csi
+    app.kubernetes.io/part-of: glusterfs-csi
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: glusterfs-csi-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: glusterfs-csi-controller
+    namespace: glusterfs-csi

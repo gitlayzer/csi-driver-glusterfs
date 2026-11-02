@@ -1,0 +1,34 @@
+# StorageClass for dynamically provisioned subdirectories of an existing GlusterFS volume.
+#
+# clusterID must be an entry of the glusterfs-csi-config ConfigMap of the
+# driver, and the parent volume (parentVolume) has to exist and be started by an
+# administrator: this driver creates directories, it does not create Gluster
+# volumes.
+#
+# onDelete decides what DeleteVolume does with the directory:
+#   - delete  removes it, the data is gone;
+#   - retain  keeps it untouched, the directory has to be cleaned up by hand;
+#   - archive renames it into ".glusterfs-csi/archive/" of the parent volume
+#     (D-26), so an accidental PVC deletion can be undone. The archive grows
+#     forever and needs a periodic cleanup by the administrator.
+#
+# A misspelled parameter makes volume creation fail with InvalidArgument instead
+# of silently falling back to a default (D-22).
+#
+# allowVolumeExpansion stays false: expansion is only implemented in M3, and
+# without the external-resizer sidecar an expansion request would hang forever.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: glusterfs-subdir
+  labels:
+    app.kubernetes.io/name: rwx-writer
+provisioner: glusterfs.csi.io
+parameters:
+  clusterID: prod
+  provisioningMode: subdir
+  parentVolume: csi-parent
+  onDelete: archive
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+allowVolumeExpansion: false

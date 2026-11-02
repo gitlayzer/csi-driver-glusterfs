@@ -1,0 +1,14 @@
+# Claim that the StorageClass provisions dynamically; no PV and no volumeHandle here.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dynamic-data
+  labels:
+    app.kubernetes.io/name: rwx-writer
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: glusterfs-subdir
+  resources:
+    requests:
+      storage: 5Gi

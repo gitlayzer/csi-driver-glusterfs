@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# Verify the kustomize deployment manifests: render the base, the sample overlay
-# and the static example with "kubectl kustomize", schema-validate the result
-# with kubeconform, and check that every rendered image reference carries an
-# explicit tag that is not "latest".
+# Verify the kustomize deployment manifests: render the base, the sample overlay,
+# the static example and the dynamic example with "kubectl kustomize",
+# schema-validate the result with kubeconform, and check that every rendered
+# image reference carries an explicit tag that is not "latest".
 #
 # Environment:
 #   KUBECTL       renderer (default: kubectl)
@@ -24,7 +24,7 @@ K8S_VERSION="${K8S_VERSION:-1.28.0}"
 # on whitespace with read -r -a instead of eval, so the shell never re-parses it.
 read -r -a kubeconform <<<"${KUBECONFORM}"
 
-dirs=(base overlays/sample examples/static)
+dirs=(base overlays/sample examples/static examples/dynamic)
 
 rendered="$(mktemp)"
 trap 'rm -f "${rendered}"' EXIT

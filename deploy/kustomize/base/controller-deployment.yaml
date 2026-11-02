@@ -1,0 +1,184 @@
+# Controller Deployment of glusterfs-csi: the driver in --mode=controller plus csi-provisioner and livenessprobe.
+#
+# The driver only implements the Controller service here; the node plugin runs as
+# the separate DaemonSet of the same base.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: glusterfs-csi-controller
+  labels:
+    app.kubernetes.io/name: glusterfs-csi
+    app.kubernetes.io/part-of: glusterfs-csi
+    app.kubernetes.io/component: controller
+spec:
+  # Only the provisioner holding the Lease sends RPCs, so the standby replica
+  # never mounts a parent volume: two replicas are cheap and let the leader be
+  # replaced within about 15s (D-28).
+  replicas: 2
+  # The pods use hostNetwork, so their declared ports are host ports and two
+  # replicas can never be scheduled onto the same node. maxSurge 0 therefore
+  # keeps the rollout possible on a 2 or 3 node cluster: the old pod is deleted
+  # before the new one is created.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: glusterfs-csi
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: glusterfs-csi
+        app.kubernetes.io/part-of: glusterfs-csi
+        app.kubernetes.io/component: controller
+    spec:
+      serviceAccountName: glusterfs-csi-controller
+      # The controller mounts the parent volume, so the FUSE client has to
+      # resolve the Gluster server host names exactly like the node plugin:
+      # hostNetwork plus ClusterFirstWithHostNet gives the container the
+      # /etc/hosts the kubelet copies from the node (D-21, D-28).
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-cluster-critical
+      nodeSelector:
+        kubernetes.io/os: linux
+      # The host ports already keep the replicas on distinct nodes; the
+      # preference states that intent explicitly and still spreads them should
+      # the ports ever change.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: glusterfs-csi
+                    app.kubernetes.io/component: controller
+      containers:
+        - name: glusterfs-csi
+          image: ghcr.io/gitlayzer/glusterfs-csi:main
+          imagePullPolicy: IfNotPresent
+          # The flags of the node plugin (--nodeid, --state-dir,
+          # --recovery-interval) are deliberately absent: controller mode has no
+          # node identity and no kubelet state. The order is fixed, a test
+          # overlay patches --v by index.
+          args:
+            - --mode=controller
+            - --endpoint=unix:///csi/csi.sock
+            - --config=/etc/glusterfs-csi/config.json
+            - --controller-mount-dir=/var/lib/glusterfs-csi/controller
+            - --mount-log-dir=/var/log/glusterfs/csi
+            - --v=2
+          # Mounting the parent volume with the FUSE client needs /dev/fuse and
+          # the mount system call, which requires a privileged container.
+          securityContext:
+            privileged: true
+          # 29651 is taken by the node plugin of the same host.
+          ports:
+            - name: healthz
+              containerPort: 29652
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 5
+          # No limits on purpose: the FUSE process of the parent volume lives in
+          # this container, an OOM kill would abort running volume creations and
+          # deletions.
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+            # No mountPropagation: the parent volume mount is only used by this
+            # container, nothing else on the node needs to see it (D-28).
+            - name: parent-mounts
+              mountPath: /var/lib/glusterfs-csi/controller
+            - name: config
+              mountPath: /etc/glusterfs-csi
+              readOnly: true
+            - name: mount-log
+              mountPath: /var/log/glusterfs/csi
+        - name: csi-provisioner
+          image: registry.k8s.io/sig-storage/csi-provisioner:v6.4.0
+          args:
+            - --v=2
+            - --csi-address=/csi/csi.sock
+            - --leader-election
+            - --leader-election-namespace=$(NAMESPACE)
+            # The first CreateVolume has to mount the parent volume, which makes
+            # the default 15s too tight. A call that does time out is retried by
+            # the sidecar and the driver is idempotent.
+            - --timeout=60s
+            - --http-endpoint=:29653
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - name: provisioner
+              containerPort: 29653
+              protocol: TCP
+          # The upstream recommendation: if the leader cannot reach the API
+          # server to renew its Lease, restart it so another replica takes over.
+          livenessProbe:
+            httpGet:
+              path: /healthz/leader-election
+              port: provisioner
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 10
+            failureThreshold: 3
+          # The PV/PVC informer caches grow with the size of the cluster, so only
+          # the memory usage is bounded.
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+        - name: liveness-probe
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.20.0
+          args:
+            - --v=2
+            - --csi-address=/csi/csi.sock
+            - --http-endpoint=:29652
+            - --probe-timeout=5s
+          resources:
+            requests:
+              cpu: 10m
+              memory: 20Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /csi
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+        # The FUSE process of the parent volume ends with the container, so the
+        # mount point does not have to survive the pod.
+        - name: parent-mounts
+          emptyDir: {}
+        # Mounted as a directory, without "optional" and without "items" (no
+        # subPath either): only then does the kubelet update the file in place
+        # when the ConfigMap changes, which the driver hot-reloads.
+        - name: config
+          configMap:
+            name: glusterfs-csi-config
+        - name: mount-log
+          emptyDir: {}
