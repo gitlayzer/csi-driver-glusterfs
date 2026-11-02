@@ -106,7 +106,8 @@ type Executor interface {
 ```
 - MVP 实现：SSH（`golang.org/x/crypto/ssh`），参数逐个 shell-quote，绝不拼接字符串。
 - 只调用 `gluster --mode=script --xml ...`，用 XML 解析结果，不解析人类可读输出。
-- 主机故障时按 ConfigMap 中 servers 顺序故障转移（任一 glusterd 都可执行管理命令）。
+- 主机故障时按 ConfigMap 中 servers 顺序故障转移（任一 glusterd 都可执行管理命令），只在远端命令尚未执行时换主机，上次成功的主机优先（D-34）。
+- 每次调用新建连接；主机密钥强制按凭据中的 `known_hosts` 校验；驱动不加 `sudo`，提权交给 wrapper；凭据格式见 D-34，来源在 T-17 决定。
 - 安全：提供 `hack/gluster-csi-wrapper.sh`，配合 `authorized_keys` 的 `command=` 限制该密钥只能执行白名单 gluster/lvm 命令。
 - 预留第二实现：Gluster 节点上的轻量 agent（gRPC + mTLS），不在早期里程碑内。
 
