@@ -90,6 +90,8 @@ mountOptions: [log-level=WARNING]
 ```
 `provisioningMode` 缺省为 `subdir`，`onDelete` 缺省为 `delete`。参数名区分大小写；不认识的参数会让创建失败（`InvalidArgument`），以免拼错的参数被静默忽略（D-22）。
 
+父卷 `csi-parent` 需由管理员预先创建并启动。每个 PVC 对应父卷根目录下的一个子目录 `<PV 名>`（权限 0777）；驱动自己的数据放在父卷的隐藏目录 `.glusterfs-csi/` 中：`volumes/` 存每个卷的容量与删除策略，`archive/` 存 `onDelete: archive` 归档的目录（`<PV 名>-<UTC 时间戳>`）。不要手工修改 `.glusterfs-csi/`；归档目录确认不再需要后可直接删除。`onDelete: retain` 保留的目录不会被同名的新卷接管。
+
 ### 3.3 独立卷（强隔离 / 快照）
 ```yaml
 apiVersion: storage.k8s.io/v1

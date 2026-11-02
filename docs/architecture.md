@@ -75,7 +75,8 @@ csi:
 
 ### 4.2 subdir（共享卷子目录，M2，默认模式）
 - 每个 PVC = 预建大卷 `parentVolume` 下的一个子目录 `/<pvName>`。
-- Controller 以 FUSE 挂载父卷，`mkdir` / `rm -rf`（或归档重命名）。**不需要 SSH**。
+- Controller 以 FUSE 挂载父卷（每个父卷挂一次并缓存，D-24），`mkdir` / `rm -rf`（或归档重命名）。**不需要 SSH**。
+- 父卷布局（D-25）：根目录只放卷目录 `<pvName>`（0777，D-27）；驱动数据放在 `.glusterfs-csi/`：`volumes/<pvName>.json` 记录容量与 `onDelete`，`archive/` 放归档目录。
 - Node 侧使用 Gluster 原生子目录挂载 `host:/parentVolume/pvName`，客户端只看得到自己的目录。
 - StorageClass 参数（D-22）：`clusterID`（必填）、`provisioningMode`（缺省 `subdir`）、`parentVolume`（必填）、`onDelete`（缺省 `delete`）、`quota`；不认识的参数返回 `InvalidArgument`，`csi.storage.k8s.io/` 前缀的参数由 sidecar 处理、驱动忽略。
 - 可选 `quota: "true"`（M3）：通过 Executor 执行 `gluster volume quota <vol> limit-usage /<dir> <size>` 实现容量强制和扩容。
@@ -137,7 +138,7 @@ type Executor interface {
 - Controller 多副本由 sidecar 做 leader election，驱动本身不需要选主。
 
 ### 5.6 删除策略
-SC 参数 `onDelete: delete | retain | archive`（archive = 重命名为 `archived-<pv>-<时间戳>`），默认 `delete`。
+SC 参数 `onDelete: delete | retain | archive`，默认 `delete`。策略在 CreateVolume 时写入卷的元数据文件（D-25），DeleteVolume 从元数据读取：`delete` 删除目录；`retain` 保留目录、只删元数据（同名卷之后不能再创建，需管理员处理）；`archive` 重命名为 `.glusterfs-csi/archive/<pv>-<UTC 时间戳>`（D-26）。有目录而无元数据的卷视为非本驱动创建，DeleteVolume 不动它并返回成功。
 
 ### 5.7 可观测性
 - klog 结构化日志，每个 RPC 记录 method / volume_id / 耗时 / 结果码；Secret 内容绝不入日志。
