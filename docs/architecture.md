@@ -77,7 +77,8 @@ csi:
 - 每个 PVC = 预建大卷 `parentVolume` 下的一个子目录 `/<pvName>`。
 - Controller 以 FUSE 挂载父卷，`mkdir` / `rm -rf`（或归档重命名）。**不需要 SSH**。
 - Node 侧使用 Gluster 原生子目录挂载 `host:/parentVolume/pvName`，客户端只看得到自己的目录。
-- 可选 `quota: "true"`：通过 Executor 执行 `gluster volume quota <vol> limit-usage /<dir> <size>` 实现容量强制和扩容。
+- StorageClass 参数（D-22）：`clusterID`（必填）、`provisioningMode`（缺省 `subdir`）、`parentVolume`（必填）、`onDelete`（缺省 `delete`）、`quota`；不认识的参数返回 `InvalidArgument`，`csi.storage.k8s.io/` 前缀的参数由 sidecar 处理、驱动忽略。
+- 可选 `quota: "true"`（M3）：通过 Executor 执行 `gluster volume quota <vol> limit-usage /<dir> <size>` 实现容量强制和扩容。
 - 优点：秒级创建、可支撑数千 PV、不增加 brick 进程数。缺点：隔离性弱于独立卷，不支持快照。
 
 ### 4.3 volume（每 PVC 一个独立 Gluster 卷，M3/M4）

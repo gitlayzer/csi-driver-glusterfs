@@ -82,12 +82,13 @@ parameters:
   clusterID: prod
   provisioningMode: subdir
   parentVolume: csi-parent
-  quota: "true"            # 需要 executor；不开启则容量仅为声明值
+  # quota: "true"          # M3 起支持，需要 executor；M2 设为 "true" 会被拒绝，不设则容量仅为声明值
   onDelete: delete         # delete | retain | archive
 reclaimPolicy: Delete
-allowVolumeExpansion: true
+allowVolumeExpansion: true   # 扩容在 M3 实现
 mountOptions: [log-level=WARNING]
 ```
+`provisioningMode` 缺省为 `subdir`，`onDelete` 缺省为 `delete`。参数名区分大小写；不认识的参数会让创建失败（`InvalidArgument`），以免拼错的参数被静默忽略（D-22）。
 
 ### 3.3 独立卷（强隔离 / 快照）
 ```yaml
