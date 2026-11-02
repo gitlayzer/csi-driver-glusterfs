@@ -1,0 +1,24 @@
+# Values that make the default rendering equal to the kustomize sample overlay
+# plus the dynamic provisioning example: only "clusters" and one StorageClass are
+# set, everything else comes from values.yaml. hack/verify-helm.sh renders with
+# this file (D-33).
+
+# Same content as deploy/kustomize/overlays/sample/config.json.
+clusters:
+  - clusterID: prod
+    servers:
+      - gluster-1.example.com
+      - gluster-2.example.com
+      - gluster-3.example.com
+
+# Same parameters as deploy/kustomize/examples/dynamic/storageclass.yaml.
+storageClasses:
+  - name: glusterfs-subdir
+    parameters:
+      clusterID: prod
+      provisioningMode: subdir
+      parentVolume: csi-parent
+      onDelete: archive
+    reclaimPolicy: Delete
+    volumeBindingMode: Immediate
+    allowVolumeExpansion: false

@@ -1,0 +1,37 @@
+# StorageClasses requested through .Values.storageClasses; none by default.
+#
+# clusterID must be an entry of the glusterfs-csi-config ConfigMap of the driver.
+# A misspelled parameter makes volume creation fail with InvalidArgument instead
+# of silently falling back to a default (D-22). allowVolumeExpansion stays false
+# unless it is set explicitly: without the external-resizer an expansion request
+# would hang forever (D-29).
+{{- range $index, $class := .Values.storageClasses }}
+{{- if $index }}
+---
+{{- end }}
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: {{ required "storageClasses[].name is required" $class.name }}
+  {{- with $class.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  labels:
+    {{- include "glusterfs-csi.labels" (dict "ctx" $) | nindent 4 }}
+    {{- with $class.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+provisioner: glusterfs.csi.io
+parameters:
+  {{- required "storageClasses[].parameters is required" $class.parameters | toYaml | nindent 2 }}
+reclaimPolicy: {{ $class.reclaimPolicy | default "Delete" }}
+volumeBindingMode: {{ $class.volumeBindingMode | default "Immediate" }}
+# hasKey, not default: an explicit "false" must render as false and not fall
+# through to the default (it is the value D-29 asks for).
+allowVolumeExpansion: {{ if hasKey $class "allowVolumeExpansion" }}{{ $class.allowVolumeExpansion | default false }}{{ else }}false{{ end }}
+{{- with $class.mountOptions }}
+mountOptions:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,27 @@
+# Configuration of the driver, read from this ConfigMap by both the node plugin
+# and the controller.
+#
+# The entries of .Values.clusters are serialised verbatim (D-32): field names
+# and extra keys are kept as the installer wrote them (only the key order becomes
+# alphabetical), because it is the driver that parses and validates the file. The kubelet updates the mounted file
+# in place when this ConfigMap changes, which the driver hot-reloads within about
+# 10s; there is deliberately no checksum annotation on the pods.
+#
+# The ConfigMap carries no labels at all: the kustomize sample overlay generates
+# it with configMapGenerator, which adds none either. Adding the Helm labels here
+# would make the two installation methods produce different objects (D-33).
+{{- if not .Values.clusters }}
+{{- fail "clusters is required: at least one cluster with clusterID and servers" }}
+{{- end }}
+{{- range $i, $cluster := .Values.clusters }}
+{{- $_ := required (printf "clusters[%d].clusterID is required" $i) $cluster.clusterID }}
+{{- $_ := required (printf "clusters[%d].servers is required" $i) $cluster.servers }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: glusterfs-csi-config
+  namespace: {{ .Release.Namespace }}
+data:
+  config.json: |
+    {{- .Values.clusters | toPrettyJson | nindent 4 }}

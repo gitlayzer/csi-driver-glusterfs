@@ -1,12 +1,14 @@
 # Makefile for glusterfs-csi.
 #
 # Common targets:
-#   make build   - compile bin/glusterfs-csi with version information
-#   make test    - run unit tests with the race detector
-#   make lint    - run golangci-lint
-#   make image   - build a multi-arch image (amd64 + arm64, no push)
-#   make sanity  - run csi-sanity against a local GlusterFS container
-#   make clean   - remove build artifacts
+#   make build            - compile bin/glusterfs-csi with version information
+#   make test             - run unit tests with the race detector
+#   make lint             - run golangci-lint
+#   make image            - build a multi-arch image (amd64 + arm64, no push)
+#   make sanity           - run csi-sanity against a local GlusterFS container
+#   make verify-manifests - render the kustomize manifests and validate them with kubeconform
+#   make verify-helm      - lint the Helm chart and check it matches the kustomize manifests
+#   make clean            - remove build artifacts
 
 BINARY     ?= glusterfs-csi
 BIN_DIR    ?= bin
@@ -30,7 +32,7 @@ GOFLAGS   ?=
 GOLANGCI  ?= golangci-lint
 DOCKER    ?= docker
 
-.PHONY: all build test lint vet fmt image verify-manifests sanity clean help
+.PHONY: all build test lint vet fmt image verify-manifests verify-helm sanity clean help
 
 all: build
 
@@ -65,6 +67,10 @@ image:
 ## verify-manifests: render the kustomize manifests and validate them with kubeconform
 verify-manifests:
 	hack/verify-manifests.sh
+
+## verify-helm: lint the Helm chart and check it matches the kustomize manifests
+verify-helm:
+	hack/verify-helm.sh
 
 ## sanity: run csi-sanity against a local GlusterFS container (needs docker with privileged containers)
 sanity:

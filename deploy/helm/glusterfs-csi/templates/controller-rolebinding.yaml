@@ -1,0 +1,19 @@
+# Binds the leader election Role to the controller ServiceAccount.
+#
+# The namespace of the subject is spelled out explicitly so the manifest does not
+# depend on a kustomize namespace transformer having run.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: glusterfs-csi-provisioner-cfg
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "glusterfs-csi.labels" (dict "ctx" .) | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: glusterfs-csi-provisioner-cfg
+subjects:
+  - kind: ServiceAccount
+    name: glusterfs-csi-controller
+    namespace: {{ .Release.Namespace }}

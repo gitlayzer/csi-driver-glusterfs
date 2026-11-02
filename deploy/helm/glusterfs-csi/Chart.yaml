@@ -1,0 +1,15 @@
+apiVersion: v2
+name: glusterfs-csi
+description: Kubernetes CSI driver for GlusterFS
+type: application
+version: 0.1.0
+appVersion: "main"
+kubeVersion: ">=1.28.0-0"
+home: https://github.com/gitlayzer/csi-driver-glusterfs
+sources:
+  - https://github.com/gitlayzer/csi-driver-glusterfs
+keywords:
+  - csi
+  - storage
+  - glusterfs
+  - fuse

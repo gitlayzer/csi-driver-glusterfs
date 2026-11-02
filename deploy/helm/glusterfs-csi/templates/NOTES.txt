@@ -1,0 +1,26 @@
+glusterfs-csi has been installed into the "{{ .Release.Namespace }}" namespace.
+
+The driver is a DaemonSet on every Linux node plus a Deployment of
+{{ .Values.controller.replicas }} controller replica(s); the
+resource names are fixed (glusterfs-csi-node, glusterfs-csi-controller,
+glusterfs-csi-config, CSIDriver glusterfs.csi.io), so only one installation per
+cluster is possible.
+
+Check the pods and the node registration:
+
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/part-of=glusterfs-csi
+  kubectl get csinodes -o wide
+
+The node plugin and the controller need privileged pods. If Pod Security
+Admission enforces the baseline or restricted level on this namespace, label it:
+
+  kubectl label namespace {{ .Release.Namespace }} pod-security.kubernetes.io/enforce=privileged
+
+The node DaemonSet uses updateStrategy OnDelete: "helm upgrade" does not restart
+the plugin pods, because restarting one disconnects every GlusterFS mount of that
+node. Drain the node's workloads and delete the plugin pod node by node instead:
+
+  kubectl -n {{ .Release.Namespace }} delete pod -l app.kubernetes.io/name=glusterfs-csi,app.kubernetes.io/component=node --field-selector spec.nodeName=<node>
+
+Changes to "clusters" are hot-reloaded by the driver from the ConfigMap within
+about 10s, no restart is needed.
