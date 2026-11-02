@@ -74,7 +74,7 @@ csi:
 ```
 
 ### 4.2 subdir（共享卷子目录，M2，默认模式）
-- 每个 PVC = 预建大卷 `parentVolume` 下的一个子目录 `/<pvName>`。
+- 每个 PVC = 预建大卷 `parentVolume` 下的一个子目录 `/<pvName>`（卷名长到放不进 128 字节的 volume_id 时改用派生名 `<前缀>-<16 位哈希>`，D-30；K8s 的 PV 名不会触发）。
 - Controller 以 FUSE 挂载父卷（每个父卷挂一次并缓存，D-24），`mkdir` / `rm -rf`（或归档重命名）。**不需要 SSH**。
 - 父卷布局（D-25）：根目录只放卷目录 `<pvName>`（0777，D-27）；驱动数据放在 `.glusterfs-csi/`：`volumes/<pvName>.json` 记录容量与 `onDelete`，`archive/` 放归档目录。
 - Node 侧使用 Gluster 原生子目录挂载 `host:/parentVolume/pvName`，客户端只看得到自己的目录。
@@ -96,6 +96,7 @@ gfs:v1:<mode>:<clusterID>:<glusterVolume>[:<subdir>]
 - 带版本号 `v1`，未来格式变化可向后兼容解析。
 - `clusterID` → ConfigMap `glusterfs-csi-config` 中的条目：`servers`（多个，用于 `backup-volfile-servers`）、`executorSecretRef`、默认挂载选项。服务器 IP 变化只改 ConfigMap，不需要改 PV。
 - 所有字段经白名单正则校验（`^[A-Za-z0-9._-]{1,128}$`），**拒绝任何可能进入 shell 的特殊字符**。
+- 整个 volume_id 不超过 128 字节（CSI 对字符串字段的默认上限）。subdir 卷的子目录名由 CreateVolume 用 `volumeid.SubdirName` 决定（D-30），其余 RPC 只从 volume_id 解出子目录名，从不根据卷名重新推导。
 
 ### 5.2 Executor（Gluster 管理通道）
 ```go
