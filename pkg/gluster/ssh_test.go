@@ -1,6 +1,7 @@
 package gluster
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -231,6 +232,60 @@ func TestSSHExecutorExitErrorStderr(t *testing.T) {
 	}
 	if want := "gluster on gluster-1 exited with status 1: cannot connect to the glusterd on this host"; err.Error() != want {
 		t.Errorf("Error() = %q, want %q", err.Error(), want)
+	}
+}
+
+// TestSSHExecutorExitErrorStdout checks that the stdout of a command that exited
+// with a non-zero status is kept: gluster answers with a complete --xml document
+// and a non-zero opRet in that case, and `volume quota list` even exits with
+// status 2 while printing the answer.
+func TestSSHExecutorExitErrorStdout(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		stdout     string
+		wantStdout []byte
+	}{
+		{
+			name:       "stdout is carried unchanged",
+			stdout:     "<cliOutput><opRet>-1</opRet></cliOutput>",
+			wantStdout: []byte("<cliOutput><opRet>-1</opRet></cliOutput>"),
+		},
+		{
+			name:       "stdout is truncated to 64 KiB",
+			stdout:     strings.Repeat("a", maxExitStdout) + "tail",
+			wantStdout: []byte(strings.Repeat("a", maxExitStdout)),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			hostKey := newTestSigner(t)
+			clientKey := newTestSigner(t)
+			server := newTestSSHServer(t, hostKey, clientKey.PublicKey(), modeHandler)
+			server.handler = func(string) (string, string, int) { return tc.stdout, "", 1 }
+			creds := testCredentials(t, hostKey, clientKey, "gluster-1", server.Port())
+			executor := newTestExecutor(t, creds, SSHOptions{}, map[string]string{
+				net.JoinHostPort("gluster-1", fmt.Sprintf("%d", server.Port())): server.Addr(),
+			})
+
+			stdout, err := executor.Run(context.Background(), "gluster-1", "gluster", "--mode=script", "--xml", "volume", "info")
+			var exitErr *ExitError
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("Run = %v, want *ExitError", err)
+			}
+			if stdout != nil {
+				t.Errorf("Run returned %d bytes of stdout together with an error, want nil", len(stdout))
+			}
+			if !bytes.Equal(exitErr.Stdout, tc.wantStdout) {
+				t.Errorf("Stdout = %d bytes, want %d bytes", len(exitErr.Stdout), len(tc.wantStdout))
+			}
+			if want := "gluster on gluster-1 exited with status 1"; err.Error() != want {
+				t.Errorf("Error() = %q, want %q (it must not contain stdout)", err.Error(), want)
+			}
+		})
 	}
 }
 

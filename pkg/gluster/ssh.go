@@ -154,6 +154,7 @@ func (e *SSHExecutor) Run(ctx context.Context, host string, args ...string) ([]b
 			Host:    host,
 			Program: args[0],
 			Code:    code,
+			Stdout:  truncateOutput(stdout.Bytes(), maxExitStdout),
 			Stderr:  truncateOutput(stderr.Bytes(), maxExitStderr),
 		}
 	}

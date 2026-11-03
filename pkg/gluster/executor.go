@@ -22,6 +22,12 @@ const (
 	// maxExitStderr is the number of stderr bytes kept in an [ExitError].
 	maxExitStderr = 64 << 10
 
+	// maxExitStdout is the number of stdout bytes kept in an [ExitError]. A
+	// gluster command that exits non-zero may still have written a complete
+	// --xml answer (volume quota list exits with status 2 when quota is
+	// disabled), so the output has to survive the failure.
+	maxExitStdout = 64 << 10
+
 	// maxExitStderrMessage is the number of stderr bytes shown in the message of
 	// an [ExitError]. Anything longer is truncated and marked with "...".
 	maxExitStderrMessage = 256
@@ -73,6 +79,12 @@ type ExitError struct {
 	Program string
 	// Code is the exit status the server reported.
 	Code int
+	// Stdout is what the command wrote to standard output, truncated to 64 KiB.
+	// It is kept because a non-zero exit status does not mean the command failed:
+	// gluster answers with a complete --xml document and a non-zero opRet in that
+	// case, and `volume quota list` even exits with status 2 while printing the
+	// answer. It is never part of [ExitError.Error]: the caller parses it.
+	Stdout []byte
 	// Stderr is what the command wrote to standard error, truncated to 64 KiB.
 	Stderr []byte
 }
