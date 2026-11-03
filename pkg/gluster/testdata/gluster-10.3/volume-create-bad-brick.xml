@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cliOutput>
+  <opRet>-1</opRet>
+  <opErrno>30800</opErrno>
+  <opErrstr>Brick: gfs-golden:/bricks/b1/t16vol not available. Brick may be containing or be contained by an existing brick.</opErrstr>
+</cliOutput>

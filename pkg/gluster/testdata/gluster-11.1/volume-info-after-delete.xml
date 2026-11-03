@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cliOutput>
+  <opRet>0</opRet>
+  <opErrno>0</opErrno>
+  <opErrstr/>
+  <volInfo>
+    <volumes>
+      <volume>
+        <name>t16one</name>
+        <id>d8d9c6f9-87d2-4a5d-9dc7-a231593b0779</id>
+        <status>1</status>
+        <statusStr>Started</statusStr>
+        <snapshotCount>0</snapshotCount>
+        <brickCount>1</brickCount>
+        <distCount>1</distCount>
+        <replicaCount>1</replicaCount>
+        <arbiterCount>0</arbiterCount>
+        <disperseCount>0</disperseCount>
+        <redundancyCount>0</redundancyCount>
+        <type>0</type>
+        <typeStr>Distribute</typeStr>
+        <transport>0</transport>
+        <bricks>
+          <brick uuid="cf610ff8-a41a-44b7-b4f3-c476f6a4cb4d">gfs-golden:/bricks/one/t16one<name>gfs-golden:/bricks/one/t16one</name><hostUuid>cf610ff8-a41a-44b7-b4f3-c476f6a4cb4d</hostUuid><isArbiter>0</isArbiter></brick>
+        </bricks>
+        <optCount>3</optCount>
+        <options>
+          <option>
+            <name>storage.fips-mode-rchecksum</name>
+            <value>on</value>
+          </option>
+          <option>
+            <name>transport.address-family</name>
+            <value>inet</value>
+          </option>
+          <option>
+            <name>nfs.disable</name>
+            <value>on</value>
+          </option>
+        </options>
+      </volume>
+      <count>1</count>
+    </volumes>
+  </volInfo>
+</cliOutput>

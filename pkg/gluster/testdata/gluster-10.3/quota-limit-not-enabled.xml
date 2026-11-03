@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cliOutput>
+  <opRet>-1</opRet>
+  <opErrno>30800</opErrno>
+  <opErrstr>Quota is disabled, please enable quota</opErrstr>
+  <cliOp>volQuota</cliOp>
+</cliOutput>

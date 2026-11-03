@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cliOutput>
+  <opRet>0</opRet>
+  <opErrno>0</opErrno>
+  <opErrstr/>
+  <volQuota>
+    <limit>
+      <path>/d3</path>
+      <hard_limit>N/A</hard_limit>
+      <soft_limit_percent>N/A</soft_limit_percent>
+      <soft_limit_value>N/A</soft_limit_value>
+      <used_space>0</used_space>
+      <avail_space>N/A</avail_space>
+      <sl_exceeded>N/A</sl_exceeded>
+      <hl_exceeded>N/A</hl_exceeded>
+    </limit>
+  </volQuota>
+</cliOutput>

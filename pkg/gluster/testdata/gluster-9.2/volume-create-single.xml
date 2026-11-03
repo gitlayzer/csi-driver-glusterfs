@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cliOutput>
+  <opRet>0</opRet>
+  <opErrno>0</opErrno>
+  <opErrstr/>
+  <volCreate>
+    <volume>
+      <name>t16one</name>
+      <id>3ea83b6f-33fd-42fb-9190-b07746a683d7</id>
+    </volume>
+  </volCreate>
+</cliOutput>

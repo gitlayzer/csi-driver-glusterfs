@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cliOutput>
+  <opRet>-1</opRet>
+  <opErrno>30806</opErrno>
+  <opErrstr>Volume does not exist</opErrstr>
+  <volInfo>
+    <volumes>
+      <count>0</count>
+    </volumes>
+  </volInfo>
+</cliOutput>

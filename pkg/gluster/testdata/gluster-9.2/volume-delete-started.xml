@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cliOutput>
+  <opRet>-1</opRet>
+  <opErrno>30800</opErrno>
+  <opErrstr>Volume t16one has been started.Volume needs to be stopped before deletion.</opErrstr>
+</cliOutput>

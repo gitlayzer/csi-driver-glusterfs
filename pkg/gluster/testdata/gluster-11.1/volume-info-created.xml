@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cliOutput>
+  <opRet>0</opRet>
+  <opErrno>0</opErrno>
+  <opErrstr/>
+  <volInfo>
+    <volumes>
+      <volume>
+        <name>t16vol</name>
+        <id>3a7e1715-304c-40d4-9eb0-84ecb106241b</id>
+        <status>0</status>
+        <statusStr>Created</statusStr>
+        <snapshotCount>0</snapshotCount>
+        <brickCount>3</brickCount>
+        <distCount>1</distCount>
+        <replicaCount>3</replicaCount>
+        <arbiterCount>0</arbiterCount>
+        <disperseCount>0</disperseCount>
+        <redundancyCount>0</redundancyCount>
+        <type>2</type>
+        <typeStr>Replicate</typeStr>
+        <transport>0</transport>
+        <bricks>
+          <brick uuid="cf610ff8-a41a-44b7-b4f3-c476f6a4cb4d">gfs-golden:/bricks/b1/t16vol<name>gfs-golden:/bricks/b1/t16vol</name><hostUuid>cf610ff8-a41a-44b7-b4f3-c476f6a4cb4d</hostUuid><isArbiter>0</isArbiter></brick>
+          <brick uuid="cf610ff8-a41a-44b7-b4f3-c476f6a4cb4d">gfs-golden:/bricks/b2/t16vol<name>gfs-golden:/bricks/b2/t16vol</name><hostUuid>cf610ff8-a41a-44b7-b4f3-c476f6a4cb4d</hostUuid><isArbiter>0</isArbiter></brick>
+          <brick uuid="cf610ff8-a41a-44b7-b4f3-c476f6a4cb4d">gfs-golden:/bricks/b3/t16vol<name>gfs-golden:/bricks/b3/t16vol</name><hostUuid>cf610ff8-a41a-44b7-b4f3-c476f6a4cb4d</hostUuid><isArbiter>0</isArbiter></brick>
+        </bricks>
+        <optCount>5</optCount>
+        <options>
+          <option>
+            <name>cluster.granular-entry-heal</name>
+            <value>on</value>
+          </option>
+          <option>
+            <name>storage.fips-mode-rchecksum</name>
+            <value>on</value>
+          </option>
+          <option>
+            <name>transport.address-family</name>
+            <value>inet</value>
+          </option>
+          <option>
+            <name>nfs.disable</name>
+            <value>on</value>
+          </option>
+          <option>
+            <name>performance.client-io-threads</name>
+            <value>off</value>
+          </option>
+        </options>
+      </volume>
+      <count>1</count>
+    </volumes>
+  </volInfo>
+</cliOutput>

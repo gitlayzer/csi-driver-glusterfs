@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cliOutput>
+  <opRet>-1</opRet>
+  <opErrno>30800</opErrno>
+  <opErrstr>removexattr failed on /var/run/gluster/t16vol_quota_limit/d2. Reason : No data available</opErrstr>
+  <cliOp>volQuota</cliOp>
+</cliOutput>

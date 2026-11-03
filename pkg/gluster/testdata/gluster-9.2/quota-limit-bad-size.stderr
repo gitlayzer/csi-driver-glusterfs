@@ -1,0 +1,8 @@
+Please enter an integer value in the range of (1 - 9223372036854775807)
+
+Usage:
+volume quota <VOLNAME> {enable|disable|list [<path> ...]| list-objects [<path> ...] | remove <path>| remove-objects <path> | default-soft-limit <percent>}
+volume quota <VOLNAME> {limit-usage <path> <size> [<percent>]}
+volume quota <VOLNAME> {limit-objects <path> <number> [<percent>]}
+volume quota <VOLNAME> {alert-time|soft-timeout|hard-timeout} {<time>}
+

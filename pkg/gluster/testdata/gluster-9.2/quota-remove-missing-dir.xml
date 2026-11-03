@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cliOutput>
+  <opRet>-2</opRet>
+  <opErrno>30800</opErrno>
+  <opErrstr>Failed to get trusted.gfid attribute on path /nosuch. Reason : No such file or directory</opErrstr>
+  <cliOp>volQuota</cliOp>
+</cliOutput>
